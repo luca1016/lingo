@@ -1,0 +1,94 @@
+# 本番昇格。人が手動で起動し、Environment "production" の承認後に直列で進む。
+#   build → D1 バックアップ(artifact)→ migration(本番)→ deploy → /api/health 疎通(失敗なら rollback を試みる)
+# Secrets(Environment "production"): CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, ACCESS_TEAM_DOMAIN, ACCESS_AUD, ALLOWED_EMAIL
+# Variables(Environment "production"): APP_URL(例 https://lingo.example.com。末尾スラッシュなし)
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "昇格する ref(branch / tag / SHA)"
+        required: true
+        default: main
+concurrency:
+  group: release
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ACCESS_TEAM_DOMAIN: ${{ secrets.ACCESS_TEAM_DOMAIN }}
+      ACCESS_AUD: ${{ secrets.ACCESS_AUD }}
+      ALLOWED_EMAIL: ${{ secrets.ALLOWED_EMAIL }}
+      APP_URL: ${{ vars.APP_URL }}
+    steps:
+      - name: 設定の確認(欠落なら止める)
+        run: |
+          for k in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID ACCESS_TEAM_DOMAIN ACCESS_AUD ALLOWED_EMAIL APP_URL; do
+            if [ -z "${!k}" ]; then echo "::error::$k が未設定"; exit 1; fi
+          done
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: 昇格する commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+
+      - name: D1 バックアップ(本番)
+        run: |
+          mkdir -p backup
+          pnpm exec wrangler d1 export lingo-db --remote --env="" \
+            --output "backup/lingo-db-$(date -u +%Y%m%dT%H%M%SZ)-${{ steps.sha.outputs.sha }}.sql"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d1-backup-${{ steps.sha.outputs.sha }}
+          path: backup/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: migration(本番 D1)
+        run: pnpm exec wrangler d1 migrations apply lingo-db --remote --env=""
+
+      - name: deploy
+        run: |
+          pnpm exec wrangler deploy --env="" \
+            --message "release ${{ steps.sha.outputs.sha }}" \
+            --var "ACCESS_TEAM_DOMAIN:$ACCESS_TEAM_DOMAIN" \
+            --var "ACCESS_AUD:$ACCESS_AUD" \
+            --var "ALLOWED_EMAIL:$ALLOWED_EMAIL" \
+            --var "GIT_SHA:${{ steps.sha.outputs.sha }}"
+
+      # /api/health は Access の Bypass(パス限定)で外から見える前提。README「人がやる基盤作業」(a)
+      - name: 疎通(/api/health が新しい commit を返すこと)
+        id: health
+        run: |
+          for i in $(seq 1 12); do
+            body=$(curl -fsS --max-time 10 "$APP_URL/api/health" || true)
+            echo "try $i: $body"
+            if echo "$body" | grep -q '"ok":true' && echo "$body" | grep -q "${{ steps.sha.outputs.sha }}"; then exit 0; fi
+            sleep 10
+          done
+          echo "::error::/api/health が新しい版を返さない"
+          exit 1
+
+      - name: rollback(疎通失敗時)
+        if: failure() && steps.health.outcome == 'failure'
+        run: |
+          pnpm exec wrangler rollback --env="" --yes --message "health check failed for ${{ steps.sha.outputs.sha }}" \
+            || echo "::warning::rollback に失敗(初回デプロイなど)。手で確認すること"
+          echo "::warning::D1 の migration は巻き戻していない(追加のみの原則で旧コードは動く想定)。バックアップは artifact にある"

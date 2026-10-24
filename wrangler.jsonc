@@ -1,0 +1,56 @@
+// lingo の Worker 設定。設計書: brain projects/lingo.md §2
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lingo",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-24",
+  // 入口はカスタムドメインのみ(routes は人が Cloudflare 側で設定する。README「人がやる基盤作業」(c))
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    // 静的アセットも必ず Worker(Access JWT 検証)を通す。外さないこと
+    "run_worker_first": true,
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lingo-db",
+      "database_id": "REPLACE_ME_PROD",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // 値は空のまま commit する(空なら Worker は全経路 403)。
+  // 本番は release workflow が GitHub Secrets から `wrangler deploy --var KEY:VALUE` で注入する。
+  // preview は preview workflow が同様に `--env preview --var ...` で注入する。
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
+    "ALLOWED_EMAIL": "",
+    "GIT_SHA": ""
+  },
+  "observability": { "enabled": true },
+  "env": {
+    "preview": {
+      "workers_dev": false,
+      "preview_urls": false,
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "lingo-db-preview",
+          "database_id": "REPLACE_ME_PREVIEW",
+          "migrations_dir": "migrations"
+        }
+      ],
+      // vars は env に継承されないので明示する(値は workflow で注入)
+      "vars": {
+        "ACCESS_TEAM_DOMAIN": "",
+        "ACCESS_AUD": "",
+        "ALLOWED_EMAIL": "",
+        "GIT_SHA": ""
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "lingo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "自分用の語彙 SRS(Cloudflare Workers + D1 + Preact)",
+  "type": "module",
+  "packageManager": "pnpm@11.20.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && wrangler deploy --dry-run --env=\"\" --outdir .wrangler/dry-run",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "check": "biome check .",
+    "test": "vitest run",
+    "cf-typegen": "wrangler types --strict-vars=false"
+  },
+  "dependencies": {
+    "hono": "^4.13.13",
+    "jose": "^6.2.13",
+    "preact": "^11.0.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.2",
+    "@cloudflare/vitest-plugin": "^1.4.7",
+    "@preact/preset-vite": "^2.10.6",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.152.0"
+  }
+}

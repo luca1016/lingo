@@ -1,0 +1,26 @@
+# PR に対して "test" という名前の check を出す。ブランチ保護(runner/setup-repo.sh)がこの名前を必須にしている。
+# Cloudflare の資格情報は一切使わない(D1 はローカル、deploy は --dry-run)。
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm check
+      - run: pnpm test
+      # Vite ビルド + wrangler deploy --dry-run(Worker の実バンドル。資格情報不要)
+      - run: pnpm build

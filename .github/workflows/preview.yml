@@ -1,0 +1,95 @@
+# preview 環境へのデプロイ。人が手動で起動し、Environment "preview" の承認後に進む。
+#   非本番 D1(lingo-db-preview、1 本を共有)へ migration → wrangler deploy --env preview → URL を出力(PR 番号があればコメント)
+# Secrets(Environment "preview"): CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, ACCESS_TEAM_DOMAIN, ACCESS_AUD, ALLOWED_EMAIL
+# Variables(Environment "preview"): APP_URL(preview 用カスタムドメイン。例 https://lingo-preview.example.com)
+name: preview
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "デプロイする ref(空なら pr の head)"
+        required: false
+        default: ""
+      pr:
+        description: "PR 番号(任意。指定するとその PR に URL をコメントする)"
+        required: false
+        default: ""
+concurrency:
+  group: preview
+  cancel-in-progress: false
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    environment: preview
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ACCESS_TEAM_DOMAIN: ${{ secrets.ACCESS_TEAM_DOMAIN }}
+      ACCESS_AUD: ${{ secrets.ACCESS_AUD }}
+      ALLOWED_EMAIL: ${{ secrets.ALLOWED_EMAIL }}
+      APP_URL: ${{ vars.APP_URL }}
+      INPUT_REF: ${{ inputs.ref }}
+      INPUT_PR: ${{ inputs.pr }}
+    steps:
+      - name: 設定と入力の確認
+        id: target
+        run: |
+          for k in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID ACCESS_TEAM_DOMAIN ACCESS_AUD ALLOWED_EMAIL APP_URL; do
+            if [ -z "${!k}" ]; then echo "::error::$k が未設定"; exit 1; fi
+          done
+          if [ -n "$INPUT_PR" ] && ! echo "$INPUT_PR" | grep -Eq '^[0-9]+$'; then echo "::error::pr は数字"; exit 1; fi
+          if [ -n "$INPUT_REF" ]; then ref="$INPUT_REF"
+          elif [ -n "$INPUT_PR" ]; then ref="refs/pull/$INPUT_PR/head"
+          else echo "::error::ref か pr のどちらかを指定"; exit 1; fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+      - name: デプロイする commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec vite build
+
+      - name: migration(非本番 D1)
+        run: pnpm exec wrangler d1 migrations apply lingo-db-preview --remote --env preview
+
+      - name: deploy(preview)
+        run: |
+          pnpm exec wrangler deploy --env preview \
+            --message "preview ${{ steps.sha.outputs.sha }}" \
+            --var "ACCESS_TEAM_DOMAIN:$ACCESS_TEAM_DOMAIN" \
+            --var "ACCESS_AUD:$ACCESS_AUD" \
+            --var "ALLOWED_EMAIL:$ALLOWED_EMAIL" \
+            --var "GIT_SHA:${{ steps.sha.outputs.sha }}"
+
+      - name: 疎通
+        run: |
+          for i in $(seq 1 12); do
+            body=$(curl -fsS --max-time 10 "$APP_URL/api/health" || true)
+            echo "try $i: $body"
+            if echo "$body" | grep -q "${{ steps.sha.outputs.sha }}"; then exit 0; fi
+            sleep 10
+          done
+          echo "::error::/api/health が新しい版を返さない"
+          exit 1
+
+      - name: URL を出力
+        run: |
+          echo "preview: $APP_URL (commit ${{ steps.sha.outputs.sha }})" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: PR にコメント
+        if: inputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          gh pr comment "$INPUT_PR" -R "$GITHUB_REPOSITORY" \
+            --body "preview にデプロイしました: $APP_URL (commit $SHA、非本番 D1 lingo-db-preview)"

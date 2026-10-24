@@ -1,0 +1,1 @@
+{ "test_cmd": "pnpm install --frozen-lockfile && pnpm typecheck && pnpm check && pnpm test" }

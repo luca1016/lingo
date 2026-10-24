@@ -1,0 +1,23 @@
+{
+  // Worker + テスト(workerd 上で動く)。フロントは tsconfig.client.json。
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["./worker-configuration.d.ts", "@cloudflare/vitest-plugin/types"]
+  },
+  "include": [
+    "src/worker",
+    "test",
+    "worker-configuration.d.ts",
+    "vite.config.ts",
+    "vitest.config.ts"
+  ]
+}
