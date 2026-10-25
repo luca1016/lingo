@@ -18,7 +18,7 @@
     {
       "binding": "DB",
       "database_name": "lingo-db",
-      "database_id": "REPLACE_ME_PROD",
+      "database_id": "65a0f788-84a4-4f90-b80c-8c79080c24bb",
       "migrations_dir": "migrations"
     }
   ],
@@ -40,7 +40,7 @@
         {
           "binding": "DB",
           "database_name": "lingo-db-preview",
-          "database_id": "REPLACE_ME_PREVIEW",
+          "database_id": "85054283-1017-4b62-86fc-c29c002a924c",
           "migrations_dir": "migrations"
         }
       ],
