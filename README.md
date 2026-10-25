@@ -35,6 +35,8 @@ pnpm cf-typegen   # wrangler.jsonc を変えたら worker-configuration.d.ts を
 
 ランナーはここをやらない(Cloudflare の資格情報は GitHub Secrets 以外に置かない)。上から順に。
 
+**画面操作つきの詳しい手順書: [docs/SETUP.md](docs/SETUP.md)**(初めての人はこちらを上から順に)。
+
 ### Cloudflare 側
 
 **(a) Access アプリ**(Zero Trust → Access → Applications)
