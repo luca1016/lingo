@@ -48,6 +48,7 @@ README の「人がやる基盤作業」(a)〜(g) をこの順番に並べ直し
 | どこ | 操作 |
 |---|---|
 | PC のターミナル | `pnpm dlx wrangler@latest login` を実行する |
+| 初回だけ: `Choose which packages to build` と出た場合 | pnpm がインストール時スクリプト(esbuild / workerd)の実行許可を聞いている。エラーではない。キーボードの **`a`**(全選択)→ **Enter** で進む |
 | 自動で開いたブラウザ | Cloudflare のログイン画面が出たらログインする |
 | 権限の確認画面 | 内容を確認して **Allow**(許可)を押す |
 | ブラウザ | 「You have granted authorization to Wrangler」のような完了表示が出たらタブを閉じてよい |
@@ -180,6 +181,7 @@ README の「人がやる基盤作業」(a)〜(g) をこの順番に並べ直し
 | Application name | `lingo` |
 | Session Duration | `24 hours`(既定でよい) |
 | Public hostname(古い画面では Application domain) | **Add public hostname** を押し、Subdomain に `lingo`、Domain に自分のドメインを選ぶ。Path は**空**のまま |
+| 宛先の欄に **プライベート IP / Private destination の空の行**が既定で出ている場合 | その行の右端の**ゴミ箱アイコン**で**行ごと削除**する(空欄のまま残すと保存時に `use_clientless_isolation_app_launcher_url can only be enabled for apps with private destinations` というエラーになる)。残すのは Public hostname の 1 行だけ |
 | Access policies | **Select existing policies** で `me` を選ぶ(古い画面では次のページで新規作成: 名前 `me` / Action Allow / Include → Emails → 自分のメール) |
 | Login methods(認証の画面) | **One-time PIN** が含まれていることを確認(「Accept all available identity providers」がオンならそのままでよい) |
 | ボタン | **Next** で進み、最後に **Save**(または **Add application**) |
@@ -199,7 +201,7 @@ README の「人がやる基盤作業」(a)〜(g) をこの順番に並べ直し
 |---|---|
 | Applications | **Add an application** → **Self-hosted** |
 | Application name | `lingo-health` |
-| Public hostname | Subdomain `lingo`、Domain = 自分のドメイン、**Path に `api/health`**(入力欄の前に `/` が表示されているので先頭のスラッシュは不要) |
+| Public hostname | Subdomain `lingo`、Domain = 自分のドメイン、**Path に `api/health`**(入力欄の前に `/` が表示されているので先頭のスラッシュは不要)。プライベート宛先の空の行が出ていたら 3-2 と同じく削除する |
 | Access policies | `health-bypass` を選ぶ(古い画面では名前 `health-bypass` / Action **Bypass** / Include → **Everyone** で新規作成) |
 | ボタン | **Next** → **Save** |
 
@@ -234,7 +236,7 @@ README の「人がやる基盤作業」(a)〜(g) をこの順番に並べ直し
 |---|---|
 | `wrangler deploy` / `wrangler rollback`(Worker の更新・巻き戻し、workers.dev 無効化) | Account → **Workers Scripts** → **Edit** |
 | `wrangler d1 export` / `wrangler d1 migrations apply`(本番・preview の D1) | Account → **D1** → **Edit** |
-| wrangler がアカウント情報を読む | Account → **Account Settings** → **Read** |
+| wrangler がアカウント情報を読む | Account → **Account Settings** → **Read**(**省略可**。ドロップダウンに見つからなければ付けなくてよい。workflow は `CLOUDFLARE_ACCOUNT_ID` を渡すので、上 2 つの権限だけで release / preview が動くことを 2026-10-25 に確認済み) |
 
 - カスタムドメインは手順 8 で**手で**付けるので、Zone の権限(Workers Routes)は不要です。
 - Access(Zero Trust)の権限も不要です(Access の設定は手順 3 で手で済ませています)。
@@ -250,7 +252,7 @@ README の「人がやる基盤作業」(a)〜(g) をこの順番に並べ直し
 | Token name | `lingo-github-actions` |
 | Permissions 1 行目 | `Account` / `Workers Scripts` / `Edit` |
 | **+ Add more** | `Account` / `D1` / `Edit` |
-| **+ Add more** | `Account` / `Account Settings` / `Read` |
+| **+ Add more**(省略可) | `Account` / `Account Settings` / `Read`。2 つ目のプルダウンで `Account Settings`(日本語表示では「アカウント設定」)と打って絞り込む。**見つからなければこの行は削除して 2 権限で作ってよい** |
 | Account Resources | `Include` / 自分のアカウント名(All accounts にしない) |
 | Client IP Address Filtering | 空のまま(GitHub Actions の IP は固定できないため) |
 | TTL | 任意。期限を付けるなら終了日を決め、カレンダーに「token 更新」を入れる |
@@ -404,6 +406,7 @@ lingo-db-preview: <preview の database_id>
 | **Domains & Routes** の欄 | **+ Add** |
 | 種類 | **Custom domain** |
 | Domain | `lingo.example.com`(本番ドメイン) |
+| 有効化対象(Apply to / Environment)が選べる場合 | **本番(Production)** を選ぶ(「プレビュー」はこの Worker の中の別スロットで、ここには何もデプロイされていない) |
 | ボタン | **Add domain** |
 | 状態 | 数分で証明書が発行され Active になる(DNS レコードは自動で作られる) |
 
@@ -412,7 +415,9 @@ lingo-db-preview: <preview の database_id>
 | どこ | 操作 |
 |---|---|
 | **Workers & Pages** の一覧 | **lingo-preview** を押す |
-| **Settings → Domains & Routes** | **+ Add** → **Custom domain** → `lingo-preview.example.com` → **Add domain** |
+| **Settings → Domains & Routes** | **+ Add** → **Custom domain** → `lingo-preview.example.com` → 有効化対象は **本番(Production)** → **Add domain** |
+
+- **注意**: 有効化対象は `lingo-preview` Worker でも**「本番」**です。preview workflow は `wrangler deploy --env preview` で `lingo-preview` という**別の Worker の「本番」スロット**にデプロイしています。「プレビュー」を選ぶと DNS レコードが作られず、`lingo-preview.example.com` が名前解決できません。
 
 ### 8-5. workers.dev と Preview URLs が無効か確認
 
@@ -461,13 +466,16 @@ lingo-db-preview: <preview の database_id>
 | 症状 | 原因と対処 | 確認コマンド / 画面 |
 |---|---|---|
 | `wrangler login` でブラウザが開かない | ターミナルに表示された `https://dash.cloudflare.com/oauth2/auth?...` の URL を**同じ PC の**ブラウザに貼って開く。SSH 先の別ホストで実行すると戻り先(localhost:8976)に届かないので、必ず手元の PC で実行する | `pnpm dlx wrangler@latest whoami` |
+| `pnpm dlx wrangler` が `Choose which packages to build` で止まる | pnpm のビルドスクリプト許可の確認(初回だけ)。`a` → Enter で両方(esbuild / workerd)を許可して進む | 0-2 |
+| Access アプリの保存で `use_clientless_isolation_app_launcher_url can only be enabled for apps with private destinations` | 宛先に**空のプライベート宛先(プライベート IP)の行**が残っている。その行をゴミ箱アイコンで削除し、Public hostname の 1 行だけにして保存する。ブラウザ分離や App Launcher 表示のオン/オフは関係ない | 3-2 / 3-4 |
+| カスタムドメインを付けたのに名前解決できない(`Could not resolve host`) | 有効化対象を「プレビュー」にしている。Domains & Routes でその行を Edit(または削除して追加し直し)、**本番(Production)** にする | 8-3 / 8-4 |
 | `whoami` に複数のアカウントが出る | 使うアカウントの Account ID を控える。D1 作成時に選択を聞かれたら同じものを選ぶ | `pnpm dlx wrangler@latest whoami` |
 | AUD Tag が見つからない | Applications → `lingo` → **Edit** → **Overview**(または Basic information / Additional settings)。health 用アプリの AUD と取り違えていないか確認 | Zero Trust → Access controls → Applications |
 | Actions の実行が黄色のまま進まない | 承認待ち。実行画面上部の **Review deployments** → Environment にチェック → **Approve and deploy** | Actions → 該当の実行 |
 | Run workflow ボタンが無い | workflow ファイルが main に無い、または Actions が無効。**Settings → Actions → General** で Actions が許可されているか | Actions タブ |
 | Required reviewers が選べない / Environment secrets が使えない | private リポ + Free プランのため。5-0 を参照(public にするか Pro) | Settings → Environments |
 | `::error::XXX が未設定` で止まる | その Environment に secret / variable が無い。名前の綴り(大文字・アンダースコア)と、**Repository secrets ではなく Environment secrets** に入れたかを確認 | Settings → Environments → production / preview |
-| `Authentication error [code: 10000]` | token の権限不足かアカウント違い。手順 4 の 3 権限と Account Resources を確認。`CLOUDFLARE_ACCOUNT_ID` が token のアカウントと一致しているか | My Profile → API Tokens → 該当 token → **Edit** |
+| `Authentication error [code: 10000]` | token の権限不足かアカウント違い。手順 4 の権限(Workers Scripts: Edit / D1: Edit)と Account Resources を確認。`CLOUDFLARE_ACCOUNT_ID` が token のアカウントと一致しているか | My Profile → API Tokens → 該当 token → **Edit** |
 | `/memberships` や `/user` で 403 が出る | wrangler がユーザー情報を読もうとしている。token に User → **Memberships: Read**(または User Details: Read)を追加して再実行(通常は Account ID を渡しているので不要) | 同上 |
 | D1 で `database not found` や `REPLACE_ME` を含むエラー | 手順 7 の PR が main に入っていない。ref に `main` を指定したか | `git log origin/main -- wrangler.jsonc` |
 | release / preview が「疎通」で落ちる(2 回目以降) | (1) カスタムドメインが Active でない → 8-3 / 8-4。(2) `/api/health` がログイン画面にリダイレクトされる → **Bypass アプリ未設定**、またはパス・ドメインの不一致(3-4 / 3-5)。(3) `APP_URL` の綴り・末尾スラッシュ | `curl -i https://lingo.example.com/api/health`(302 なら Bypass が効いていない、200 で JSON なら OK) |
