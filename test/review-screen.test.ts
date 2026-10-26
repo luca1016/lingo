@@ -275,6 +275,54 @@ describe("復習画面(実 API)", () => {
     expect(s.text()).toContain("つぎのカードまで");
   });
 
+  it("応答が消えたまま往復しても、同じ review_id で確定して短期カードが戻る", async () => {
+    let lost = 0;
+    connect(async (call, send) => {
+      const res = await send(); // 要求はサーバに届いている
+      if (call.path === "/api/review" && lost < 1) {
+        lost += 1;
+        throw new TypeError("Network connection lost.");
+      }
+      return res;
+    });
+    const cardId = await importOne();
+
+    const s = await openReview();
+    await answer(s, "Again"); // 届いているので 1 分後へ進んでいる
+    expect(s.text()).toContain("通信できなかった");
+    expect(await countReviews()).toBe(1);
+
+    // タブを往復しても、送った 1 件は捨てない。サーバはこのカードをまだ出さない(期限は 1 分後)
+    // ので、ここで手元から落とすと再送先も待ち時間も失う。
+    await click(buttonByText(s.root, "単票追加"));
+    await click(buttonByText(s.root, "復習"));
+    await flush();
+    expect((await serverDue()).cards).toEqual([]);
+    expect(s.text()).toContain("残り 1 枚");
+    expect(s.text()).toContain("通信できなかった");
+    expect(s.has("同じ評価をもう一度送る")).toBe(true);
+
+    // 同じ review_id で送り直すと、サーバは 1 回目の結果をそのまま返す(二重評価にならない)。
+    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
+    const bodies = reviewBodies();
+    expect(bodies).toHaveLength(2);
+    expect(new Set(bodies.map((b) => b.review_id)).size).toBe(1);
+    expect(bodies[0]).toEqual(bodies[1]);
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({
+      version: 2,
+      due: toUtcIso(new Date(NOW.getTime() + MINUTE)),
+    });
+
+    // 確定した結果で待ち時間が戻り、時間が来たら同じ画面で出る。
+    expect(s.text()).not.toContain("通信できなかった");
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+    vi.advanceTimersByTime(MINUTE);
+    await flush();
+    expect(s.text()).toContain("invoice");
+    expect(s.has("めくる")).toBe(true);
+  });
+
   it("送信中にタブを往復しても、取り直しが送信の結果を上書きしない", async () => {
     const held = gate();
     const refetch = gate();

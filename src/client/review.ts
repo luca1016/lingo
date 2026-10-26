@@ -100,15 +100,21 @@ function toQueued(card: DueCard): QueuedCard {
  * サーバが出したものを正とし、手元にしかない「まだ期限が来ていない短期カード」だけ後ろに残す
  * (409 で出し直したときに、待っている短期カードの待ち時間表示を失わないため)。
  *
+ * `pendingCardId` は結果が未確定の 1 枚(送ったが応答が消えた)。期限を過ぎていても外さない:
+ * 評価が届いていた場合、サーバはもう期限前のカードとして出さないので、ここで落とすと同じ
+ * review_id での再送先も待ち時間表示も失う。結果を確定してから `advance` が片付ける。
  */
 export function mergeQueue(
   previous: readonly QueuedCard[],
   cards: readonly DueCard[],
   now: Date,
+  pendingCardId: string | null = null,
 ): QueuedCard[] {
   const fromServer = cards.map(toQueued);
   const ids = new Set(fromServer.map((q) => q.cardId));
-  const waiting = previous.filter((q) => !ids.has(q.cardId) && Date.parse(q.due) > now.getTime());
+  const waiting = previous.filter(
+    (q) => !ids.has(q.cardId) && (q.cardId === pendingCardId || Date.parse(q.due) > now.getTime()),
+  );
   return [...fromServer, ...waiting];
 }
 
@@ -181,12 +187,13 @@ export async function loadDue(
 ): Promise<void> {
   if (session.authExpired || session.sending) return;
   const now = options.now ?? new Date();
+  // 結果が未確定の 1 件(attempt)とその説明は捨てない。同じ review_id で再送して確定できるように。
+  const pending = session.attempt;
   const loading: Session = {
     ...session,
     loading: true,
-    failure: null,
+    failure: pending ? session.failure : null,
     notice: options.notice ?? null,
-    attempt: null,
   };
   set(loading);
 
@@ -198,7 +205,7 @@ export async function loadDue(
   set({
     ...loading,
     loading: false,
-    queue: mergeQueue(loading.queue, res.response.cards, now),
+    queue: mergeQueue(loading.queue, res.response.cards, now, pending?.cardId ?? null),
     revealed: false,
     revealedAt: null,
     newRemaining: res.response.new_remaining,

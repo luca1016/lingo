@@ -42,7 +42,8 @@ export function Review({ session, setSession }: { session: Session; setSession: 
   }, []);
 
   // 画面を開いたら出題を取り直す(タブを往復しても、待っている短期カードは手元に残る)。
-  // 送信中なら取り直さない(状態はその応答で決まる。古い取得で上書きしないため)。
+  // 送信中なら取り直さない(その応答で決まる)。結果が分からないまま離れていた場合も、送った
+  // 1 件は残してあるので、ここで取り直したあと同じ review_id で結果を確定できる(loadDue)。
   useEffect(() => {
     void loadDue(session, setSession);
   }, []);
