@@ -60,6 +60,46 @@ export const CONFLICT = 409;
 /** 結果が不明なときの案内(同じ review_id で再送すれば二重には記録されない)。 */
 export const RESEND_HINT = "同じ評価をもう一度送れる(二重には記録されない)";
 
+/**
+ * 評価の送信をあきらめる期限(ms)。fetch の完了だけでなく、応答本文の読み取りまでを含める。
+ * 切れかけの回線では要求も応答も何も起きないまま進まないことがあり、期限が無いと画面は
+ * 「送信中」のまま(再送もできないまま)固まる。期限を超えたら結果は分からないものとして扱い、
+ * 同じ review_id での再送に任せる。
+ */
+export const POST_TIMEOUT_MS = 15_000;
+
+/** 期限を見にいく間隔(ms)。 */
+const DEADLINE_TICK_MS = 250;
+
+interface Deadline {
+  /** 期限が来たら中断する印(本物の fetch はこれで切れる)。 */
+  signal: AbortSignal;
+  /** 期限が来たときだけ解決する。 */
+  reached: Promise<void>;
+  /** 期限の監視をやめる(先に応答が来たとき)。 */
+  stop: () => void;
+}
+
+/**
+ * 期限の監視。発火時刻ではなく壁時計(`Date.now()`)で判定するので、スマホでタブが寝ていて
+ * タイマーが遅れても、経った時間はそのまま数えられる。
+ */
+function startDeadline(ms: number): Deadline {
+  const controller = new AbortController();
+  const limit = Date.now() + ms;
+  let reach: () => void = () => {};
+  const reached = new Promise<void>((resolve) => {
+    reach = resolve;
+  });
+  const timer = setInterval(() => {
+    if (Date.now() < limit) return;
+    clearInterval(timer);
+    controller.abort();
+    reach();
+  }, DEADLINE_TICK_MS);
+  return { signal: controller.signal, reached, stop: () => clearInterval(timer) };
+}
+
 function networkError(message: string): ReviewApiError {
   return { error: "network_error", message };
 }
@@ -108,12 +148,34 @@ export async function getDue(limit?: number): Promise<ApiResult<DueResponse>> {
 /**
  * POST /api/review。同一 Origin + JSON(guard.ts)で送る。
  * review_id は呼び出し側が持っているので、通信に失敗しても同じ要求をそのまま再送できる。
+ *
+ * 応答本文の読み取りまでを 1 つの期限(`POST_TIMEOUT_MS`)で区切る。期限を超えたら
+ * 「届いたか分からない」として返すので、画面は送信中のままにならず再送できる。
  */
 export async function postReview(attempt: ReviewAttempt): Promise<ApiResult<ReviewResponse>> {
+  const deadline = startDeadline(POST_TIMEOUT_MS);
+  const timedOut = deadline.reached.then<ApiResult<ReviewResponse>>(() => ({
+    ok: false,
+    status: 0,
+    error: networkError(`応答を待てなかった(${POST_TIMEOUT_MS / 1000} 秒)。${RESEND_HINT}`),
+  }));
+  try {
+    // 期限が先に来たら、まだ終わっていない送信の結果は捨てる(再送で確かめ直す)。
+    return await Promise.race([sendReview(attempt, deadline.signal), timedOut]);
+  } finally {
+    deadline.stop();
+  }
+}
+
+async function sendReview(
+  attempt: ReviewAttempt,
+  signal: AbortSignal,
+): Promise<ApiResult<ReviewResponse>> {
   let res: Response;
   try {
     res = await fetch("/api/review", {
       method: "POST",
+      signal,
       headers: { "Content-Type": "application/json" },
       // 送る項目はここで並べる(呼び出し側が持っている余分な印は本文に出さない)。
       body: JSON.stringify({
@@ -126,7 +188,7 @@ export async function postReview(attempt: ReviewAttempt): Promise<ApiResult<Revi
       }),
     });
   } catch {
-    // 要求が届いたかどうかも分からない(オフライン・切断など)。
+    // 要求が届いたかどうかも分からない(オフライン・切断・期限超過での中断など)。
     return { ok: false, status: 0, error: networkError(`通信できなかった。${RESEND_HINT}`) };
   }
   if (!res.ok) return { ok: false, status: res.status, error: await errorOf(res) };

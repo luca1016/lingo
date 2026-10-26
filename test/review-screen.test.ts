@@ -8,6 +8,7 @@
 //  - 応答が消えたあとの再送で二重評価にならない(同じ review_id・同じ expected_version)
 //  - 未確定の 1 件があるあいだは再送しかできない(別カードの評価・取得・タブ復帰での差し替えが無い)
 //  - 409 は確定として扱い、最新を取り直して続ける
+//  - 応答がいつまでも返らない送信は期限で未確定になり、同じ本文で再送できる(送信中のまま固まらない)
 //  - 認証切れ(401)は再ログインを案内し、再送ループにしない
 //  - 取得中は GET を重ねて出さない / 表示中は GET を出さない(表示中のカードが入れ替わらない)
 //  - 短期カード(学習ステップ)は next_due_at で待ち時間を出し、時間が来たらサーバーから出し直す
@@ -18,6 +19,7 @@ import { h } from "preact";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/client/App";
 import { resetSession } from "../src/client/review";
+import { POST_TIMEOUT_MS } from "../src/client/review-api";
 import type { ImportResponse } from "../src/shared/cards";
 import type { DueResponse } from "../src/shared/review";
 import { toUtcIso } from "../src/worker/time";
@@ -698,7 +700,7 @@ describe("復習画面(未確定の 1 件)", () => {
     const cases: [string, () => Promise<Response>, string][] = [
       ["5xx", async () => new Response("boom", { status: 500 }), "失敗しました(500)"],
       [
-        "タイムアウト",
+        "通信の中断(即時の例外)",
         async () => {
           throw new TypeError("The operation timed out.");
         },
@@ -735,6 +737,53 @@ describe("復習画面(未確定の 1 件)", () => {
       expect(await stateOf(cardId), name).toMatchObject({ version: 2 });
       expect(s.text(), name).not.toContain("送信を確認できません");
     }
+  });
+
+  it("5: 応答がいつまでも返らなければ、期限で未確定にして同じ本文で再送できる", async () => {
+    // 要求はサーバに届くが、応答(と本文の読み取り)がいつまでも終わらない通信。
+    const stuck = gate();
+    let hold = true;
+    connect(async (call, send) => {
+      const res = await send(); // 要求はサーバに届いている
+      if (call.path === "/api/review" && hold) {
+        hold = false;
+        await stuck.wait; // 応答は返ってこない
+      }
+      return res;
+    });
+    const cardId = await importOne();
+
+    const s = await openReview();
+    await answer(s, "Good");
+
+    // 期限が来るまでは送信中(評価も再送もできない)。
+    expect(s.text()).toContain("送信中は評価を受け付けない");
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+    expect(s.has("再送")).toBe(false);
+
+    // 期限を過ぎたら、結果の分からない 1 件として扱う(送信中のまま固まらない)。
+    vi.advanceTimersByTime(POST_TIMEOUT_MS);
+    await flush();
+    expect(s.text()).toContain("送信を確認できません");
+    expect(s.text()).toContain("応答を待てなかった");
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+
+    // 同じ review_id・同じ expected_version で再送すると、サーバは 1 回目の結果を返す。
+    await click(buttonByText(s.root, "再送"));
+    const bodies = reviewBodies();
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+    expect(s.text()).not.toContain("送信を確認できません");
+    expect(s.text()).toContain("つぎのカードまで");
+
+    // 捨てた 1 回目の応答が後から返っても、確定した結果は動かない。
+    stuck.open();
+    await flush();
+    expect(reviewBodies()).toHaveLength(2);
+    expect(await countReviews()).toBe(1);
+    expect(s.text()).toContain("つぎのカードまで");
   });
 
   it("5: 404(カードが無い)でも確定させず、同じ attempt の再送に任せる", async () => {
