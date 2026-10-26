@@ -64,6 +64,8 @@ export interface ReviewRow {
   review_id: string;
   card_id: string;
   rating: number;
+  /** 適用前の card_state.version(= state_before.version)。0003 より前に入った行は NULL。 */
+  version_before: number | null;
   occurred_at: string;
   received_at: string;
   elapsed_ms: number | null;

@@ -160,9 +160,59 @@ describe("0002_imports.sql", () => {
   });
 });
 
+describe("0003_reviews_version_before.sql", () => {
+  it("reviews に version_before(INTEGER・NULL 可)が足されている", async () => {
+    const { results } = await env.DB.prepare("PRAGMA table_info(reviews)").all<{
+      name: string;
+      type: string;
+      notnull: number;
+      pk: number;
+    }>();
+    const column = results.find((c) => c.name === "version_before");
+    expect(column).toBeDefined();
+    expect(column?.type).toBe("INTEGER");
+    // 旧コードが入れた行と既存行は NULL になる(新旧コード互換)。主キーは review_id のまま。
+    expect(column?.notnull).toBe(0);
+    expect(column?.pk).toBe(0);
+    expect(results.filter((c) => c.pk > 0).map((c) => c.name)).toEqual(["review_id"]);
+  });
+
+  it("version_before を書かない INSERT も通る(列は NULL になる)", async () => {
+    const at = "2026-10-26T00:00:00.000Z";
+    await env.DB.prepare(
+      `INSERT INTO cards (id, deck_id, front, back, created_at, updated_at)
+       VALUES ('legacy-card', ?, 'invoice', '請求書', ?, ?)`,
+    )
+      .bind(DEFAULT_DECK_ID, at, at)
+      .run();
+    // 列を知らない旧コードの INSERT(列を列挙する)がそのまま通ること。
+    await env.DB.prepare(
+      `INSERT INTO reviews (review_id, card_id, rating, occurred_at, received_at, state_before,
+         state_after, review_log, fsrs_version, params_version)
+       VALUES ('legacy', 'legacy-card', 3, ?, ?, '{}', '{}', '{}', 'x', 1)`,
+    )
+      .bind(at, at)
+      .run();
+
+    const row = await env.DB.prepare(
+      "SELECT version_before FROM reviews WHERE review_id = 'legacy'",
+    ).first<{ version_before: number | null }>();
+    expect(row?.version_before).toBeNull();
+
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM reviews WHERE review_id = 'legacy'"),
+      env.DB.prepare("DELETE FROM cards WHERE id = 'legacy-card'"),
+    ]);
+  });
+});
+
 describe("migration の運用", () => {
   it("0001 から順に並んでいる", () => {
-    expect(env.TEST_MIGRATIONS.map((m) => m.name)).toEqual(["0001_init.sql", "0002_imports.sql"]);
+    expect(env.TEST_MIGRATIONS.map((m) => m.name)).toEqual([
+      "0001_init.sql",
+      "0002_imports.sql",
+      "0003_reviews_version_before.sql",
+    ]);
   });
 
   it("追加のみ(DROP・列削除が無い)", () => {
@@ -182,22 +232,31 @@ describe("migration の運用", () => {
     expect(await count("settings")).toBe(1);
   });
 
-  it("適用済みの DB に、別の接続から 0001 の SQL を素のまま流しても壊れない", async () => {
+  it("適用済みの DB に、別の接続から migration の SQL を素のまま流しても壊れない", async () => {
     // applyD1Migrations は d1_migrations を見るので 2 回目は何もしない。
-    // 追跡表を介さない経路(= 別セッションでの素の実行)でも落ちず、行も設定値も変わらないこと。
+    // 追跡表を介さない経路(= 別セッションでの素の実行)でも、行も設定値も変わらないこと。
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
     const before = await env.DB.prepare("SELECT * FROM settings WHERE id = 1").first();
 
     const session = env.DB.withSession("first-primary");
     for (const migration of env.TEST_MIGRATIONS) {
       for (const query of migration.queries) {
-        await session.prepare(query).run();
+        try {
+          await session.prepare(query).run();
+        } catch (error) {
+          // SQLite の ALTER TABLE ADD COLUMN には IF NOT EXISTS が無いので、列がある分だけは
+          // 落ちる(何も書き換えない)。それ以外の文が落ちるのは migration の書き方の誤り。
+          expect(stripComments(query), migration.name).toMatch(/^\s*ALTER TABLE \w+ ADD COLUMN\b/i);
+          expect(String(error), migration.name).toMatch(/duplicate column name/);
+        }
       }
     }
 
     expect(await tableNames()).toEqual(expect.arrayContaining(TABLES));
     expect(await columnNames("cards")).toEqual(expect.arrayContaining(["front", "back"]));
-    expect(await columnNames("reviews")).toContain("elapsed_ms");
+    expect(await columnNames("reviews")).toEqual(
+      expect.arrayContaining(["elapsed_ms", "version_before"]),
+    );
     expect(await count("decks")).toBe(1);
     expect(await count("settings")).toBe(1);
     expect(await env.DB.prepare("SELECT * FROM settings WHERE id = 1").first()).toEqual(before);

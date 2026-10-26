@@ -255,6 +255,8 @@ describe("commitReview(1 batch で条件付き UPDATE + INSERT)", () => {
     expect(await getCardState(env.DB, CARD_ID)).toEqual(args.next);
     const row = await getReview(env.DB, REVIEW_ID);
     expect(row?.card_id).toBe(CARD_ID);
+    // version_before は state_before.version と同じ値(batch の条件付き UPDATE が見る)。
+    expect(row?.version_before).toBe(state.version);
     expect(JSON.parse(row?.state_before ?? "null")).toEqual(state);
     expect(JSON.parse(row?.state_after ?? "null")).toEqual(args.next);
     expect(row?.fsrs_version).toBe(FSRSVersion);
@@ -287,6 +289,33 @@ describe("commitReview(1 batch で条件付き UPDATE + INSERT)", () => {
       n: number;
     }>();
     expect(counted?.n).toBe(1);
+  });
+
+  it("同じ review_id が別の version から使われていたら、version が合っていても進めない", async () => {
+    const state = await seedNew();
+    expect(await commitReview(env.DB, commitArgs(state))).toBe(true);
+
+    // 今の version(2)からもう 1 回、同じ冪等キーで確定しようとしたもの。
+    // version の条件は満たすが、INSERT は冪等キーの衝突で無視されるので UPDATE も 0 件になる
+    // (= 同じ review_id で state が 2 回進まない)。
+    const current = (await getCardState(env.DB, CARD_ID)) as CardStateRow;
+    expect(current.version).toBe(2);
+    expect(await commitReview(env.DB, commitArgs(current))).toBe(false);
+
+    expect(await getCardState(env.DB, CARD_ID)).toEqual(current);
+    expect((await getReview(env.DB, REVIEW_ID))?.version_before).toBe(1);
+    const counted = await env.DB.prepare("SELECT COUNT(*) AS n FROM reviews").first<{
+      n: number;
+    }>();
+    expect(counted?.n).toBe(1);
+  });
+
+  it("state_before.version が expectedVersion と食い違えば呼び出し側の誤りとして投げる", async () => {
+    const state = await seedNew();
+    const args = commitArgs(state);
+    await expect(
+      commitReview(env.DB, { ...args, expectedVersion: args.expectedVersion + 1 }),
+    ).rejects.toThrow(/version/);
   });
 
   it("同じ review_id が別のカードに使われていたら、そのカードの state も進めない", async () => {
