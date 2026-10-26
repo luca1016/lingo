@@ -34,15 +34,18 @@ export type ApiResult<T> =
   | { ok: true; response: T }
   | { ok: false; status: number; error: ReviewApiError };
 
-/** POST /api/review に送る 1 件(冪等キーつき)。同じ要求の再送はこれをそのまま使い回す。 */
+/**
+ * POST /api/review に送る 1 件(冪等キーつき)。送る本文そのままの形で持つので、
+ * 同じ要求の再送は 1 回目とまったく同じ本文になる。
+ */
 export interface ReviewAttempt {
-  reviewId: string;
-  cardId: string;
+  review_id: string;
+  card_id: string;
   rating: ReviewRating;
-  expectedVersion: number;
+  expected_version: number;
   /** 解答した時刻(UTC ISO)。再送でも変えない。 */
-  occurredAt: string;
-  elapsedMs: number | null;
+  occurred_at: string;
+  elapsed_ms: number | null;
 }
 
 /** 認証切れを表す status(worker の accessAuth が API 経路で返す)。 */
@@ -112,13 +115,14 @@ export async function postReview(attempt: ReviewAttempt): Promise<ApiResult<Revi
     res = await fetch("/api/review", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      // 送る項目はここで並べる(呼び出し側が持っている余分な印は本文に出さない)。
       body: JSON.stringify({
-        review_id: attempt.reviewId,
-        card_id: attempt.cardId,
+        review_id: attempt.review_id,
+        card_id: attempt.card_id,
         rating: attempt.rating,
-        expected_version: attempt.expectedVersion,
-        occurred_at: attempt.occurredAt,
-        elapsed_ms: attempt.elapsedMs,
+        expected_version: attempt.expected_version,
+        occurred_at: attempt.occurred_at,
+        elapsed_ms: attempt.elapsed_ms,
       }),
     });
   } catch {

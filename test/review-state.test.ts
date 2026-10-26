@@ -1,18 +1,16 @@
 // 復習画面の状態機械(src/client/review.ts の `reduce`)の単体テスト。
-// 不変条件を状態機械そのものの上で固定する(実 API・実画面を通した流れは review-screen.test.ts)。
+// 設計書の遷移表をそのまま押さえる(実 API・実画面を通した流れは review-screen.test.ts)。
 //
-//  A: sending / unresolved の間は、他のカードの評価・待ち行列の差し替え・表示カードの変更を
-//     すべて拒否する(できるのは同じ attempt の再送と、取得で確定済みかを見ることだけ)
-//  B: その間に返った取得は反映せず保留し、attempt が確定してから反映する。
-//     出している 1 枚は期限の到来や新しい due の出現では入れ替わらない
-//  C: attempt の確定は 200(冪等を含む)と 409 だけ。通信失敗は unresolved に移る
+//  - サーバーが唯一の正。持つのは current(表示中の 1 枚)と attempt(未確定の送信 1 件)だけ
+//  - current がある間、GET の応答は反映しない(中身を捨てる)
+//  - attempt がある間できるのは再送だけ
 //
-// 拒否した action では同じ参照をそのまま返す(= 画面は 1 ミリも動かない)ので、`toBe` で押さえる。
+// 表に無い組み合わせは「無視」= 同じ参照を返すので、`toBe` で押さえる。
 
 import { describe, expect, it } from "vitest";
-import { type Action, newSession, reduce, type Session } from "../src/client/review";
+import { type Event, initialSession, reduce, type Session, unresolved } from "../src/client/review";
 import type { ReviewAttempt } from "../src/client/review-api";
-import type { DueCard, ReviewRating, ReviewState } from "../src/shared/review";
+import type { DueCard, DueResponse, ReviewRating } from "../src/shared/review";
 
 const NOW = Date.parse("2026-10-26T01:23:45.000Z");
 const MINUTE = 60 * 1000;
@@ -21,7 +19,6 @@ function iso(at: number): string {
   return new Date(at).toISOString();
 }
 
-/** 期限が来ている新規カード 1 枚(due は既定で 1 分前)。 */
 function dueCard(cardId: string, over: Partial<DueCard> = {}): DueCard {
   return {
     card_id: cardId,
@@ -39,366 +36,250 @@ function dueCard(cardId: string, over: Partial<DueCard> = {}): DueCard {
   };
 }
 
+function dueResponse(cards: DueCard[], nextDueAt: string | null = null): DueResponse {
+  return {
+    now: iso(NOW),
+    limit: 20,
+    cards,
+    next_due_at: nextDueAt,
+    new_today: 0,
+    new_remaining: 20,
+  };
+}
+
 function attemptFor(cardId: string, rating: ReviewRating = 1, version = 1): ReviewAttempt {
   return {
-    reviewId: `review-${cardId}-${rating}-${version}`,
-    cardId,
+    review_id: `review-${cardId}-${rating}-${version}`,
+    card_id: cardId,
     rating,
-    expectedVersion: version,
-    occurredAt: iso(NOW),
-    elapsedMs: 1000,
+    expected_version: version,
+    occurred_at: iso(NOW),
+    elapsed_ms: 1000,
   };
-}
-
-/** 評価を適用したあとのサーバの状態(既定は Again = 学習ステップ 1 分後)。 */
-function appliedState(over: Partial<ReviewState> = {}): ReviewState {
-  return {
-    due: iso(NOW + MINUTE),
-    version: 2,
-    fsrs_state: 1,
-    reps: 1,
-    lapses: 0,
-    scheduled_days: 0,
-    last_review: iso(NOW),
-    ...over,
-  };
-}
-
-/** 取得を 1 回終えた状態(期限が早い 1 枚を出している)。 */
-function loaded(cards: DueCard[] = [dueCard("A"), dueCard("B")]): Session {
-  const started = reduce(newSession(), { type: "load_started", force: false, notice: null });
-  return reduce(started, {
-    type: "load_succeeded",
-    generation: started.generation,
-    cards,
-    newRemaining: 20,
-    now: NOW,
-  });
 }
 
 const ATTEMPT = attemptFor("A");
 
+/** NEXT → GET_OK を 1 往復させる。 */
+function load(session: Session, response: DueResponse): Session {
+  const started = reduce(session, { type: "NEXT" });
+  expect(started.fetch.inflight).toBe(true);
+  return reduce(started, { type: "GET_OK", gen: started.fetch.gen, response });
+}
+
+/** A を出している状態。 */
+function showing(cards: DueCard[] = [dueCard("A"), dueCard("B")]): Session {
+  const session = load(initialSession(), dueResponse(cards));
+  expect(session.current?.card.card_id).toBe("A");
+  return session;
+}
+
 /** A をめくって Again を送り始めた状態。 */
-function sending(cards?: DueCard[]): Session {
-  const revealed = reduce(loaded(cards), { type: "reveal", cardId: "A", now: NOW });
-  const next = reduce(revealed, { type: "send_started", attempt: ATTEMPT });
-  expect(next.phase).toEqual({ kind: "sending", attempt: ATTEMPT });
+function sending(): Session {
+  const revealed = reduce(showing(), { type: "REVEAL", now: NOW });
+  const next = reduce(revealed, { type: "RATE", attempt: ATTEMPT });
+  expect(next.attempt).toMatchObject({ phase: "sending", review_id: ATTEMPT.review_id });
   return next;
 }
 
 /** 送ったが結果が分からない状態。 */
-function unresolved(cards?: DueCard[]): Session {
-  const next = reduce(sending(cards), {
-    type: "send_unresolved",
-    attempt: ATTEMPT,
-    reason: "通信できなかった",
+function unresolvedSession(): Session {
+  const next = reduce(sending(), {
+    type: "POST_FAILED",
+    reviewId: ATTEMPT.review_id,
+    message: "通信できなかった",
   });
-  expect(next.phase).toMatchObject({ kind: "unresolved", attempt: ATTEMPT });
+  expect(unresolved(next)).toMatchObject({ review_id: ATTEMPT.review_id });
   return next;
 }
 
-/** どの action も状態を動かさないこと。 */
-function rejectsAll(session: Session, actions: readonly Action[]): void {
-  for (const action of actions) {
-    expect(reduce(session, action), action.type).toBe(session);
+/** どの出来事でも状態が 1 ミリも動かないこと。 */
+function ignoresAll(session: Session, events: readonly Event[]): void {
+  for (const event of events) {
+    expect(reduce(session, event), event.type).toBe(session);
   }
 }
 
-describe("復習の状態機械(取得と表示)", () => {
-  it("取得し終えたら、期限がいちばん早い 1 枚を出す", () => {
-    const session = loaded();
-    expect(session.phase).toEqual({ kind: "showing", cardId: "A", revealedAt: null });
-    expect(session.queue.map((q) => q.cardId)).toEqual(["A", "B"]);
-    expect(session.fetching).toBe(false);
+describe("復習の状態機械(取得)", () => {
+  it("NEXT で世代を進めて取得に入り、応答の 1 枚目を出す", () => {
+    const session = showing();
+    expect(session.fetch).toEqual({ gen: 1, inflight: false });
+    expect(session.current).toEqual({ card: dueCard("A"), version: 1 });
+    expect(session.revealedAt).toBeNull();
+    expect(session.remaining).toBe(2);
     expect(session.newRemaining).toBe(20);
+    expect(session.waitUntil).toBeNull();
   });
 
-  it("出すカードが無ければ done、待ちがあれば idle", () => {
-    expect(loaded([]).phase).toEqual({ kind: "done" });
-    expect(loaded([dueCard("A", { due: iso(NOW + MINUTE) })]).phase).toEqual({ kind: "idle" });
+  it("取得中は重ねて NEXT を出さない(世代も使わない)", () => {
+    const started = reduce(initialSession(), { type: "NEXT" });
+    expect(started.fetch).toEqual({ gen: 1, inflight: true });
+    ignoresAll(started, [{ type: "NEXT" }]);
   });
 
-  it("裏をめくれるのは出している 1 枚だけ", () => {
-    const session = loaded();
-    expect(reduce(session, { type: "reveal", cardId: "B", now: NOW })).toBe(session);
-    const revealed = reduce(session, { type: "reveal", cardId: "A", now: NOW });
-    expect(revealed.phase).toEqual({ kind: "showing", cardId: "A", revealedAt: NOW });
-    // めくり直しても時刻は動かない(評価までの時間を測り直さない)。
-    expect(reduce(revealed, { type: "reveal", cardId: "A", now: NOW + 1000 })).toBe(revealed);
+  it("空の応答は next_due_at を待ち時間にする(無ければ今日は完了)", () => {
+    const waiting = load(initialSession(), dueResponse([], iso(NOW + MINUTE)));
+    expect(waiting.current).toBeNull();
+    expect(waiting.waitUntil).toBe(iso(NOW + MINUTE));
+    expect(waiting.remaining).toBe(0);
+
+    const done = load(initialSession(), dueResponse([]));
+    expect(done.waitUntil).toBeNull();
   });
 
-  it("不変条件 B: 出している 1 枚は、別のカードの期限が来ても入れ替わらない", () => {
-    const session = loaded([dueCard("A"), dueCard("B", { due: iso(NOW + MINUTE) })]);
-    expect(session.phase).toEqual({ kind: "showing", cardId: "A", revealedAt: null });
-    expect(reduce(session, { type: "tick", now: NOW + 2 * MINUTE })).toBe(session);
-    // 新しい due が増えても出している 1 枚は変わらない(待ち行列だけ増える)。
-    const reloaded = startAndApply(session, [dueCard("C"), dueCard("A"), dueCard("B")]);
-    expect(reloaded.phase).toEqual(session.phase);
-    expect(reloaded.queue.map((q) => q.cardId)).toEqual(["C", "A", "B"]);
-  });
-
-  it("待ちのあいだは期限が来た 1 枚を出す(tick)", () => {
-    const session = loaded([dueCard("A", { due: iso(NOW + MINUTE) })]);
-    expect(reduce(session, { type: "tick", now: NOW })).toBe(session);
-    const shown = reduce(session, { type: "tick", now: NOW + MINUTE });
-    expect(shown.phase).toEqual({ kind: "showing", cardId: "A", revealedAt: null });
-  });
-
-  it("取得中に重ねて始めない(世代も使わない)。開き直したときだけ取り直す", () => {
-    const first = reduce(newSession(), { type: "load_started", force: false, notice: null });
-    expect(first.fetching).toBe(true);
-    expect(reduce(first, { type: "load_started", force: false, notice: null })).toBe(first);
-    const forced = reduce(first, { type: "load_started", force: true, notice: null });
-    expect(forced.generation).toBe(first.generation + 1);
-
-    // 古い世代の応答(成功・失敗・認証切れ)は捨てる。
-    const generation = first.generation;
-    rejectsAll(forced, [
-      { type: "load_succeeded", generation, cards: [dueCard("A")], newRemaining: 20, now: NOW },
-      { type: "load_failed", generation, failure: "通信できなかった" },
-      { type: "auth_expired", generation },
+  it("世代が合わない応答は何も動かさない", () => {
+    const started = reduce(initialSession(), { type: "NEXT" });
+    const stale = started.fetch.gen - 1;
+    ignoresAll(started, [
+      { type: "GET_OK", gen: stale, response: dueResponse([dueCard("A")]) },
+      { type: "GET_FAILED", gen: stale, message: "通信できなかった" },
+      { type: "GET_UNAUTHENTICATED", gen: stale },
     ]);
+  });
+
+  it("current があるあいだは応答の中身を捨てる(表示中のカードは切り替わらない)", () => {
+    const session = showing();
+    const started = reduce(session, { type: "NEXT" });
+    // current があるので NEXT 自体が無視される(GET は出ない)。
+    expect(started).toBe(session);
+
+    // それでも応答が届いたら(行き違い)、進行中の印を下ろすだけで中身は入れない。
+    const applied = reduce(session, {
+      type: "GET_OK",
+      gen: session.fetch.gen,
+      response: dueResponse([dueCard("B")], iso(NOW + MINUTE)),
+    });
+    expect(applied.current).toBe(session.current);
+    expect(applied.waitUntil).toBeNull();
+    expect(applied.remaining).toBe(2);
   });
 
   it("取得に失敗したら「無い」とは言わず、理由を出す", () => {
-    const started = reduce(newSession(), { type: "load_started", force: false, notice: null });
+    const started = reduce(initialSession(), { type: "NEXT" });
     const failed = reduce(started, {
-      type: "load_failed",
-      generation: started.generation,
-      failure: "通信できなかった",
+      type: "GET_FAILED",
+      gen: started.fetch.gen,
+      message: "通信できなかった",
     });
-    expect(failed.phase).toEqual({ kind: "idle" });
-    expect(failed.failure).toBe("通信できなかった");
-    expect(failed.fetching).toBe(false);
-  });
-});
+    expect(failed.fetchError).toBe("通信できなかった");
+    expect(failed.fetch.inflight).toBe(false);
+    expect(failed.current).toBeNull();
+    expect(failed.waitUntil).toBeNull();
 
-describe("復習の状態機械(送信中・未確定)", () => {
-  it("めくって出している 1 枚だけ、手元の version のまま送れる", () => {
-    const revealed = reduce(loaded(), { type: "reveal", cardId: "A", now: NOW });
-    rejectsAll(loaded(), [{ type: "send_started", attempt: ATTEMPT }]); // めくる前は送れない
-    rejectsAll(revealed, [
-      { type: "send_started", attempt: attemptFor("B") }, // 出していないカード
-      { type: "send_started", attempt: attemptFor("A", 1, 5) }, // 手元に無い version
-    ]);
-    expect(reduce(revealed, { type: "send_started", attempt: ATTEMPT }).phase).toEqual({
-      kind: "sending",
-      attempt: ATTEMPT,
-    });
+    // 取り直せる(次の NEXT で世代が進む)。
+    expect(reduce(failed, { type: "NEXT" }).fetch).toEqual({ gen: 2, inflight: true });
   });
 
-  it("不変条件 A: 送信中は他の評価・めくり直し・表示カードの変更をすべて拒否する", () => {
-    const session = sending([dueCard("A"), dueCard("B", { due: iso(NOW + MINUTE) })]);
-    rejectsAll(session, [
-      { type: "send_started", attempt: attemptFor("B") },
-      { type: "send_started", attempt: attemptFor("A", 3) },
-      { type: "reveal", cardId: "B", now: NOW },
-      { type: "tick", now: NOW + 2 * MINUTE },
-      { type: "send_resolved", attempt: attemptFor("B"), state: appliedState(), now: NOW },
-      { type: "send_unresolved", attempt: attemptFor("B"), reason: "通信できなかった" },
-      { type: "send_conflicted", attempt: attemptFor("B") },
-      { type: "load_started", force: true, notice: null }, // 結果は POST の応答で決まる
-    ]);
-  });
-
-  it("不変条件 A: 未確定のあいだは、同じ attempt の再送だけができる", () => {
-    const session = unresolved([dueCard("A"), dueCard("B", { due: iso(NOW + MINUTE) })]);
-    rejectsAll(session, [
-      { type: "send_started", attempt: attemptFor("B") }, // 他のカード
-      { type: "send_started", attempt: attemptFor("A", 3) }, // 評価を変える
-      { type: "reveal", cardId: "B", now: NOW },
-      { type: "tick", now: NOW + 2 * MINUTE },
-      // 送り直して 200 / 409 を受けるまでは確定しない(不変条件 C)。
-      { type: "send_resolved", attempt: ATTEMPT, state: appliedState(), now: NOW },
-      { type: "send_conflicted", attempt: ATTEMPT },
-    ]);
-    // 確定済みかを見る取得だけは始められる(出している 1 枚と再送キーは残る)。
-    const checking = reduce(session, { type: "load_started", force: true, notice: null });
-    expect(checking.phase).toBe(session.phase);
-    expect(checking.fetching).toBe(true);
-    // 同じ attempt の再送。
-    expect(reduce(session, { type: "send_started", attempt: ATTEMPT }).phase).toEqual({
-      kind: "sending",
-      attempt: ATTEMPT,
-    });
-  });
-
-  it("不変条件 B: 送信中に返った取得は保留し、確定してから反映する", () => {
-    const session = sending();
-    const held = reduce(session, {
-      type: "load_succeeded",
-      generation: session.generation,
-      // サーバはまだ評価前の A を出している(この版で上書きしてはいけない)。
-      cards: [dueCard("B"), dueCard("A")],
-      newRemaining: 18,
-      now: NOW,
-    });
-    expect(held.pending).toEqual({ cards: [dueCard("B"), dueCard("A")], newRemaining: 18 });
-    expect(held.phase).toBe(session.phase);
-    expect(held.queue).toBe(session.queue);
-    expect(held.newRemaining).toBe(20);
-    expect(held.fetching).toBe(false);
-
-    const resolved = reduce(held, {
-      type: "send_resolved",
-      attempt: ATTEMPT,
-      state: appliedState(),
-      now: NOW,
-    });
-    expect(resolved.pending).toBeNull();
-    expect(resolved.newRemaining).toBe(18);
-    // A は確定した version / due の短期カードとして残り、保留していた B はここで入る。
-    expect(resolved.queue.map((q) => [q.cardId, q.version, q.due])).toEqual([
-      ["B", 1, dueCard("B").due],
-      ["A", 2, appliedState().due],
-    ]);
-    expect(resolved.phase).toEqual({ kind: "showing", cardId: "B", revealedAt: null });
-  });
-
-  it("不変条件 B: 期限を過ぎてから確定しても、短期カードは保留の統合で消えない", () => {
-    const session = sending([dueCard("A")]);
-    // 送っているあいだに取得が返る(サーバはまだ A を出していない = 1 分後の期限)。
-    const held = reduce(session, {
-      type: "load_succeeded",
-      generation: session.generation,
-      cards: [],
-      newRemaining: 19,
-      now: NOW,
-    });
-    expect(held.pending).toEqual({ cards: [], newRemaining: 19 });
-
-    // 再送が確定したのは 2 分後。確定した due(1 分後)はもう過ぎている。
-    const resolved = reduce(held, {
-      type: "send_resolved",
-      attempt: ATTEMPT,
-      state: appliedState(),
-      now: NOW + 2 * MINUTE,
-    });
-    expect(resolved.queue.map((q) => [q.cardId, q.version, q.due])).toEqual([
-      ["A", 2, appliedState().due],
-    ]);
-    expect(resolved.phase).toEqual({ kind: "showing", cardId: "A", revealedAt: null });
-  });
-
-  it("不変条件 B: 確定より前に始まった取得は、確定後に返っても反映しない", () => {
-    // 取得中に評価を送り、取得の応答より先に 200 が返る状況。
-    const revealed = reduce(loaded(), { type: "reveal", cardId: "A", now: NOW });
-    const fetching = reduce(revealed, { type: "load_started", force: false, notice: null });
-    const session = reduce(fetching, { type: "send_started", attempt: ATTEMPT });
-    expect(session.fetching).toBe(true);
-    const generation = session.generation;
-
-    const resolved = reduce(session, {
-      type: "send_resolved",
-      attempt: ATTEMPT,
-      state: appliedState(),
-      now: NOW,
-    });
-    // 進行中だった取得は無効にする(世代が進む)。取り直すのは呼び出し側。
-    expect(resolved.fetching).toBe(false);
-    expect(resolved.generation).toBe(generation + 1);
-    expect(resolved.queue.map((q) => [q.cardId, q.version])).toEqual([
-      ["B", 1],
-      ["A", 2],
-    ]);
-
-    // 評価前の内容(A は version 1・期限到来済み)が後から届いても、確定した版に巻き戻さない。
-    rejectsAll(resolved, [
-      {
-        type: "load_succeeded",
-        generation,
-        cards: [dueCard("A"), dueCard("B")],
-        newRemaining: 20,
-        now: NOW,
-      },
-      { type: "load_failed", generation, failure: "通信できなかった" },
-      { type: "auth_expired", generation },
-    ]);
-  });
-
-  it("不変条件 C: 200 なら確定して次へ(短期カードは待ち時間つきで残る)", () => {
-    const resolved = reduce(sending([dueCard("A")]), {
-      type: "send_resolved",
-      attempt: ATTEMPT,
-      state: appliedState(),
-      now: NOW,
-    });
-    expect(resolved.queue.map((q) => [q.cardId, q.version, q.due])).toEqual([
-      ["A", 2, appliedState().due],
-    ]);
-    expect(resolved.phase).toEqual({ kind: "idle" });
-
-    // 学習ステップを抜けた(待ちが長い)カードは手元に残さない。
-    const graduated = reduce(sending([dueCard("A")]), {
-      type: "send_resolved",
-      attempt: ATTEMPT,
-      state: appliedState({ fsrs_state: 2, due: iso(NOW + 3 * 24 * 60 * MINUTE) }),
-      now: NOW,
-    });
-    expect(graduated.queue).toEqual([]);
-    expect(graduated.phase).toEqual({ kind: "done" });
-  });
-
-  it("不変条件 C: 409 なら手元の古い 1 枚を落として取り直しに入る", () => {
-    const session = sending();
-    const held = reduce(session, {
-      type: "load_succeeded",
-      generation: session.generation,
-      cards: [dueCard("A"), dueCard("B")],
-      newRemaining: 18,
-      now: NOW,
-    });
-    const conflicted = reduce(held, { type: "send_conflicted", attempt: ATTEMPT });
-    expect(conflicted.queue.map((q) => q.cardId)).toEqual(["B"]);
-    expect(conflicted.pending).toBeNull(); // 確定より前の内容なので使わない
-    expect(conflicted.phase).toEqual({ kind: "idle" });
-  });
-
-  it("不変条件 C: 通信失敗は unresolved に移り、再送してから確定する", () => {
-    const stuck = unresolved();
-    expect(stuck.phase).toEqual({
-      kind: "unresolved",
-      attempt: ATTEMPT,
-      reason: "通信できなかった",
-    });
-    // 待ち行列はそのまま(再送先も待ち時間も失わない)。
-    expect(stuck.queue.map((q) => q.cardId)).toEqual(["A", "B"]);
-
-    const resent = reduce(stuck, { type: "send_started", attempt: ATTEMPT });
-    const resolved = reduce(resent, {
-      type: "send_resolved",
-      attempt: ATTEMPT,
-      state: appliedState(),
-      now: NOW,
-    });
-    expect(resolved.queue.map((q) => [q.cardId, q.version])).toEqual([
-      ["B", 1],
-      ["A", 2],
-    ]);
-    expect(resolved.phase).toEqual({ kind: "showing", cardId: "B", revealedAt: null });
-  });
-
-  it("認証切れのあとは、どの action も受け付けない(再送ループを作らない)", () => {
-    const expired = reduce(unresolved(), { type: "auth_expired", generation: null });
+  it("取得が認証切れなら、以後 NEXT を受け付けない(再送ループを作らない)", () => {
+    const started = reduce(initialSession(), { type: "NEXT" });
+    const expired = reduce(started, { type: "GET_UNAUTHENTICATED", gen: started.fetch.gen });
     expect(expired.authExpired).toBe(true);
-    expect(expired.fetching).toBe(false);
-    rejectsAll(expired, [
-      { type: "load_started", force: true, notice: null },
-      { type: "send_started", attempt: ATTEMPT },
-      { type: "reveal", cardId: "A", now: NOW },
-      { type: "tick", now: NOW + MINUTE },
-    ]);
+    expect(expired.fetch.inflight).toBe(false);
+    ignoresAll(expired, [{ type: "NEXT" }, { type: "RATE", attempt: ATTEMPT }]);
   });
 });
 
-/** 取得を 1 回ぶん流す(開始 → 成功)。 */
-function startAndApply(session: Session, cards: DueCard[]): Session {
-  const started = reduce(session, { type: "load_started", force: false, notice: null });
-  return reduce(started, {
-    type: "load_succeeded",
-    generation: started.generation,
-    cards,
-    newRemaining: 20,
-    now: NOW,
+describe("復習の状態機械(めくる・評価)", () => {
+  it("めくれるのは表示中の 1 枚だけで、めくり直しても時刻は動かない", () => {
+    const session = showing();
+    const revealed = reduce(session, { type: "REVEAL", now: NOW });
+    expect(revealed.revealedAt).toBe(NOW);
+    ignoresAll(revealed, [{ type: "REVEAL", now: NOW + 1000 }]);
+    // 出していないあいだはめくれない。
+    ignoresAll(load(initialSession(), dueResponse([])), [{ type: "REVEAL", now: NOW }]);
   });
-}
+
+  it("送れるのは、めくった表示中の 1 枚とその版だけ", () => {
+    ignoresAll(showing(), [{ type: "RATE", attempt: ATTEMPT }]); // めくる前
+    const revealed = reduce(showing(), { type: "REVEAL", now: NOW });
+    ignoresAll(revealed, [
+      { type: "RATE", attempt: attemptFor("B") }, // 出していないカード
+      { type: "RATE", attempt: attemptFor("A", 1, 5) }, // 別の版
+    ]);
+    expect(reduce(revealed, { type: "RATE", attempt: ATTEMPT }).attempt).toEqual({
+      ...ATTEMPT,
+      phase: "sending",
+    });
+  });
+
+  it("送信中は、別の評価・めくり直し・取得をすべて拒否する", () => {
+    ignoresAll(sending(), [
+      { type: "RATE", attempt: attemptFor("A", 3) },
+      { type: "RATE", attempt: attemptFor("B") },
+      { type: "REVEAL", now: NOW },
+      { type: "NEXT" },
+      { type: "RESEND" },
+      // 行き違いの応答(別の review_id)では動かない。
+      { type: "POST_200", reviewId: "other" },
+      { type: "POST_409", reviewId: "other" },
+      { type: "POST_FAILED", reviewId: "other", message: "x" },
+      { type: "POST_401", reviewId: "other", message: "x" },
+    ]);
+  });
+
+  it("200 / 409 だけが確定で、確定したら取り直しに入る", () => {
+    for (const event of [
+      { type: "POST_200", reviewId: ATTEMPT.review_id },
+      { type: "POST_409", reviewId: ATTEMPT.review_id },
+    ] as const) {
+      const resolved = reduce(sending(), event);
+      expect(resolved.attempt).toBeNull();
+      expect(resolved.current).toBeNull();
+      expect(resolved.revealedAt).toBeNull();
+      // 次の NEXT で訊き直せる(手元にカードを残さない)。
+      expect(reduce(resolved, { type: "NEXT" }).fetch.inflight).toBe(true);
+    }
+  });
+
+  it("それ以外の応答は確定させず、未確定(error)にする", () => {
+    const held = unresolvedSession();
+    expect(held.attempt).toMatchObject({
+      ...ATTEMPT,
+      phase: "unresolved",
+      reason: { kind: "error", message: "通信できなかった" },
+    });
+    // 表示中の 1 枚はそのまま(再送先が分かるように残す)。
+    expect(held.current?.card.card_id).toBe("A");
+  });
+
+  it("未確定のあいだできるのは、同じ attempt の再送だけ", () => {
+    const held = unresolvedSession();
+    ignoresAll(held, [
+      { type: "RATE", attempt: attemptFor("A", 3) }, // 評価を変える
+      { type: "RATE", attempt: attemptFor("B") }, // 別のカード
+      { type: "REVEAL", now: NOW },
+      { type: "NEXT" }, // タブ復帰・待ち時間の到来も含む
+      // 再送して 200 / 409 を受けるまでは確定しない。
+      { type: "POST_200", reviewId: ATTEMPT.review_id },
+      { type: "POST_409", reviewId: ATTEMPT.review_id },
+    ]);
+
+    const resent = reduce(held, { type: "RESEND" });
+    expect(resent.attempt).toEqual({ ...ATTEMPT, phase: "sending", reason: undefined });
+    // 再送で 200(冪等)なら確定して次へ。
+    expect(reduce(resent, { type: "POST_200", reviewId: ATTEMPT.review_id }).attempt).toBeNull();
+  });
+
+  it("未確定のあいだに届いた応答も、中身は捨てる(保留して後から入れたりしない)", () => {
+    const held = unresolvedSession();
+    const applied = reduce(held, {
+      type: "GET_OK",
+      gen: held.fetch.gen,
+      response: dueResponse([dueCard("B")], iso(NOW + MINUTE)),
+    });
+    expect(applied.current).toBe(held.current);
+    expect(applied.attempt).toBe(held.attempt);
+    expect(applied.waitUntil).toBeNull();
+    expect(applied.remaining).toBe(2);
+  });
+
+  it("送信が認証切れなら未確定(auth)で、再送もしない", () => {
+    const expired = reduce(sending(), {
+      type: "POST_401",
+      reviewId: ATTEMPT.review_id,
+      message: "ログインの有効期限が切れた",
+    });
+    expect(expired.attempt).toMatchObject({ phase: "unresolved", reason: { kind: "auth" } });
+    ignoresAll(expired, [{ type: "RESEND" }, { type: "NEXT" }, { type: "RATE", attempt: ATTEMPT }]);
+  });
+});

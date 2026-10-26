@@ -16,7 +16,6 @@ import {
 } from "./draft";
 import { buildPreview, canImport } from "./preview";
 import { Review } from "./Review";
-import { newSession } from "./review";
 
 const page = { fontFamily: "system-ui, sans-serif", padding: "16px", maxWidth: "640px" };
 const field = { display: "block", width: "100%", boxSizing: "border-box", padding: "8px" } as const;
@@ -48,9 +47,8 @@ export function App() {
   const [showErrors, setShowErrors] = useState(false);
   const [paste, setPaste] = useState(() => newDraft(EMPTY_PASTE));
   const [previewed, setPreviewed] = useState<string | null>(null);
-  // 復習の状態(状態機械の phase・待ち行列・送っている 1 件・取得の世代)も App が持つ。
-  // タブを往復しても、送信状態・再送キー・短期カードの待ちを失わない。
-  const [session, setSession] = useState(newSession);
+  // 復習の状態(表示中の 1 枚・未確定の送信)は review.ts のストアが持つ。
+  // コンポーネントの外にあるので、タブを往復して作り直されても送信状態と再送キーは失われない。
 
   return (
     <main style={page}>
@@ -83,7 +81,7 @@ export function App() {
           setPreviewed={setPreviewed}
         />
       ) : (
-        <Review session={session} setSession={setSession} />
+        <Review />
       )}
     </main>
   );
