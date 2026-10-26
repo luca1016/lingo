@@ -426,7 +426,7 @@ describe("POST /api/review(入力の検証とガード)", () => {
     expect(await stateOf(cardId)).toMatchObject({ version: 1 });
   });
 
-  it("Access JWT が無い / 別 Origin / JSON でないなら書かない", async () => {
+  it("Access JWT が無い(401)/ 別 Origin / JSON でないなら書かない", async () => {
     const cardId = await importOne();
     const body = {
       review_id: "guarded",
@@ -445,7 +445,9 @@ describe("POST /api/review(入力の検証とガード)", () => {
       },
       harness.env,
     );
-    expect(noJwt.status).toBe(403);
+    // 認証切れは画面が判別できるように 401(再ログインを案内して再送をやめるため)。
+    expect(noJwt.status).toBe(401);
+    expect((await noJwt.json<{ error: string }>()).error).toBe("unauthenticated");
 
     const crossOrigin = await harness.app.request(
       `${ORIGIN}/api/review`,
@@ -480,9 +482,10 @@ describe("POST /api/review(入力の検証とガード)", () => {
     expect(await countReviews()).toBe(0);
   });
 
-  it("GET /api/due も Access JWT が無ければ 403", async () => {
+  it("GET /api/due も Access JWT が無ければ 401", async () => {
     const res = await harness.app.request(`${ORIGIN}/api/due`, {}, harness.env);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
+    expect((await res.json<{ error: string }>()).error).toBe("unauthenticated");
   });
 });
 

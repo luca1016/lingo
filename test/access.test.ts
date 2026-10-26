@@ -79,10 +79,26 @@ describe("/api/health", () => {
 });
 
 describe("Access JWT", () => {
-  it("JWT が無ければ 403(静的アセットも API も)", async () => {
+  it("JWT が無ければ静的アセットは 403、API 経路は 401(画面が再ログインを出せる)", async () => {
     expect((await get("/")).status).toBe(403);
     expect((await get("/index.html")).status).toBe(403);
-    expect((await get("/api/anything")).status).toBe(403);
+
+    const api = await get("/api/anything");
+    expect(api.status).toBe(401);
+    expect((await api.json<{ error: string; message: string }>()).error).toBe("unauthenticated");
+  });
+
+  it("API 経路は検証に通らないトークン(期限切れ・別メール・署名不正)も 401", async () => {
+    for (const opts of [
+      { exp: nowSec - 1 },
+      { email: "someone@example.com" },
+      { key: otherKey },
+      { aud: "other-aud" },
+    ] satisfies TokenOptions[]) {
+      const res = await get("/api/due", { "Cf-Access-Jwt-Assertion": await token(opts) });
+      expect(res.status, JSON.stringify(opts)).toBe(401);
+      expect((await res.json<{ error: string }>()).error).toBe("unauthenticated");
+    }
   });
 
   it("設定(team / aud / email)のどれかが空なら正しい JWT でも 403", async () => {
@@ -91,6 +107,15 @@ describe("Access JWT", () => {
       const res = await get("/", { "Cf-Access-Jwt-Assertion": jwt }, configuredEnv({ [key]: "" }));
       expect(res.status, key).toBe(403);
     }
+  });
+
+  it("設定が空なら API 経路も 403(再ログインでは直らないので 401 にしない)", async () => {
+    const res = await get(
+      "/api/due",
+      { "Cf-Access-Jwt-Assertion": await token() },
+      configuredEnv({ ACCESS_AUD: "" }),
+    );
+    expect(res.status).toBe(403);
   });
 
   it("実エントリポイントは設定が空(commit された wrangler.jsonc のまま)なので 403", async () => {

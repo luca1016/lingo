@@ -72,17 +72,41 @@ export async function verifyAccessJwt(
 
 export type AccessVariables = { accessEmail: string };
 
-/** Cf-Access-Jwt-Assertion ヘッダ(無ければ CF_Authorization cookie)を必須検証するミドルウェア。 */
+/** 認証切れ(= 再ログインで直る)の応答本文。画面はこの status を見て再ログインを案内する。 */
+export const UNAUTHENTICATED_BODY = {
+  error: "unauthenticated",
+  message: "ログインの有効期限が切れた(再ログインが必要)",
+} as const;
+
+/** 画面(fetch)が叩く経路か。ここだけ認証切れを 401 で区別する。 */
+function isApiPath(pathname: string): boolean {
+  return pathname === "/api" || pathname.startsWith("/api/");
+}
+
+/**
+ * Cf-Access-Jwt-Assertion ヘッダ(無ければ CF_Authorization cookie)を必須検証するミドルウェア。
+ *
+ * 拒否の返し方(設計書 §4「認証切れは 401 + 画面で再ログイン表示」。Issue 5 で決めた方針):
+ * - API 経路(`/api/*`)でトークンが無い・検証に通らない = 認証切れ → **401** + JSON。
+ *   画面は fetch の結果から判別できるので、再ログインを案内して再送をやめられる。
+ * - それ以外の経路(静的アセット)は従来どおり 403(ブラウザは Access が先に止める)。
+ * - 設定(vars)欠落は再ログインでは直らないので、API 経路でも 403 のまま(拒否は変わらない)。
+ */
 export function accessAuth(
   jwks: JwksResolver,
 ): MiddlewareHandler<{ Bindings: Env; Variables: AccessVariables }> {
   return async (c, next) => {
     const config = readAccessConfig(c.env);
     if (!config) return c.text("Forbidden", 403);
+    const deny = () =>
+      isApiPath(new URL(c.req.url).pathname)
+        ? c.json(UNAUTHENTICATED_BODY, 401)
+        : c.text("Forbidden", 403);
+
     const token = c.req.header("Cf-Access-Jwt-Assertion") || getCookie(c, "CF_Authorization");
-    if (!token) return c.text("Forbidden", 403);
+    if (!token) return deny();
     const email = await verifyAccessJwt(token, config, jwks);
-    if (!email) return c.text("Forbidden", 403);
+    if (!email) return deny();
     c.set("accessEmail", email);
     await next();
   };
