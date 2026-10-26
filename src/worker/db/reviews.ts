@@ -46,6 +46,10 @@ export async function insertReview(db: D1Database, review: NewReview): Promise<b
  * どちらの文も「読んだときの version(`expectedVersion`)がまだ生きている」ことを条件にしてあるので、
  * 先に別の評価が入っていた場合は 1 行も書かずに false を返す
  * (batch に包むだけでは「読んでから書くまでに割り込まれた」競合は防げないため、条件は SQL 側に置く)。
+ *
+ * UPDATE 側はさらに「この review_id のログがこのカードのものである」ことを条件にする。
+ * 同じ review_id が別のカードに先に使われていた場合、INSERT は ON CONFLICT で飛ぶので
+ * state だけが進んでしまう(= 同じ冪等キーで 2 枚動く)のを防ぐため。
  */
 export async function commitReview(
   db: D1Database,
@@ -57,7 +61,12 @@ export async function commitReview(
     expectedVersion: number;
   },
 ): Promise<boolean> {
-  const update = updateCardStateStatement(db, params.next, params.expectedVersion);
+  const update = updateCardStateStatement(
+    db,
+    params.next,
+    params.expectedVersion,
+    params.review.review_id,
+  );
   // INSERT を先に置く(UPDATE で version が進んだ後に条件を見ないように)。
   const insert = db
     .prepare(

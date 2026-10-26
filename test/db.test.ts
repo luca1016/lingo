@@ -288,6 +288,45 @@ describe("commitReview(1 batch で条件付き UPDATE + INSERT)", () => {
     }>();
     expect(counted?.n).toBe(1);
   });
+
+  it("同じ review_id が別のカードに使われていたら、そのカードの state も進めない", async () => {
+    const state = await seedNew();
+    expect(await commitReview(env.DB, commitArgs(state))).toBe(true);
+
+    // 同じ冪等キーを別のカードで(version は合っている状態で)確定しようとしたもの。
+    const otherId = "99999999-8888-4777-8666-555555555555";
+    await seedCard(otherId);
+    const otherState = toCardStateRow(otherId, createEmptyCard(NOW), 1, NOW);
+    await saveCardState(env.DB, otherState, 0);
+    const applied = applyReview({
+      state: otherState,
+      rating: 3,
+      occurredAt: NOW,
+      receivedAt: NOW,
+      parameters: generatorParameters(),
+    });
+    const other = commitArgs(state);
+    expect(
+      await commitReview(env.DB, {
+        review: {
+          ...other.review,
+          card_id: otherId,
+          state_before: otherState,
+          state_after: applied.state_after,
+        },
+        next: applied.state_after,
+        expectedVersion: otherState.version,
+      }),
+    ).toBe(false);
+
+    // ログは 1 回目(CARD_ID)の 1 行だけ。別のカードの state は動いていない。
+    expect(await getCardState(env.DB, otherId)).toEqual(otherState);
+    expect((await getReview(env.DB, REVIEW_ID))?.card_id).toBe(CARD_ID);
+    const counted = await env.DB.prepare("SELECT COUNT(*) AS n FROM reviews").first<{
+      n: number;
+    }>();
+    expect(counted?.n).toBe(1);
+  });
 });
 
 describe("出題候補の問い合わせ", () => {

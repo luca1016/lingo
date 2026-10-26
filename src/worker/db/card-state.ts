@@ -14,22 +14,30 @@ export async function getCardState(db: D1Database, cardId: string): Promise<Card
 /**
  * 「読んだときの version がまだ生きている」ことを条件にした card_state の UPDATE 文。
  * 1 文だけで使うなら saveCardState、他の文と同じ batch に混ぜるならこれを使う。
+ *
+ * `requireReviewId` を渡すと「その review_id の解答ログがこのカードのものである」ことも条件に加わる
+ * (同じ batch でログを入れた場合だけ state を進めるため。冪等キーが別のカードに使われていたら何も書かない)。
  */
 export function updateCardStateStatement(
   db: D1Database,
   next: CardStateRow,
   expectedVersion: number,
+  requireReviewId?: string,
 ): D1PreparedStatement {
   if (next.version !== expectedVersion + 1) {
     throw new Error(`version mismatch: expected ${expectedVersion + 1}, got ${next.version}`);
   }
+  const guard =
+    requireReviewId === undefined
+      ? ""
+      : " AND EXISTS (SELECT 1 FROM reviews WHERE review_id = ? AND card_id = ?)";
   return db
     .prepare(
       `UPDATE card_state
        SET due = ?, stability = ?, difficulty = ?, elapsed_days = ?, scheduled_days = ?,
            learning_steps = ?, reps = ?, lapses = ?, fsrs_state = ?, last_review = ?,
            version = ?, updated_at = ?
-       WHERE card_id = ? AND version = ?`,
+       WHERE card_id = ? AND version = ?${guard}`,
     )
     .bind(
       next.due,
@@ -46,6 +54,7 @@ export function updateCardStateStatement(
       next.updated_at,
       next.card_id,
       expectedVersion,
+      ...(requireReviewId === undefined ? [] : [requireReviewId, next.card_id]),
     );
 }
 
