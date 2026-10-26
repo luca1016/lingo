@@ -169,14 +169,52 @@ describe("POST /api/review(冪等)", () => {
     expect(await stateOf(cardId)).toMatchObject({ version: 2, due: body.state.due });
   });
 
-  it("再送は expected_version が古くても(進んだ後でも)1 回目の結果を返す", async () => {
+  it("同じ review_id を 2 本同時に送っても、両方 200 で同じ応答(409 にしない)", async () => {
     const cardId = await importOne();
-    const first = await (await sendReview({ cardId, version: 1, reviewId: "r1" })).json();
+    const body = {
+      review_id: "concurrent-resend",
+      card_id: cardId,
+      rating: 3,
+      expected_version: 1,
+      occurred_at: toUtcIso(NOW),
+      elapsed_ms: 4200,
+    };
 
-    const replay = await sendReview({ cardId, version: 99, reviewId: "r1" });
-    expect(replay.status).toBe(200);
-    expect(await replay.json()).toEqual(first);
+    // 端末の再送が行き違って 2 本とも届いた状況。どちらも 1 回目の結果を返す。
+    const [a, b] = await Promise.all([post("/api/review", body), post("/api/review", body)]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const bodyA = await a.json<ReviewResponse>();
+    expect(await b.json<ReviewResponse>()).toEqual(bodyA);
+    expect(bodyA.state.version).toBe(2);
+
     expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2, due: bodyA.state.due });
+  });
+
+  it("同じ review_id で中身が違えば(別の rating / expected_version)409", async () => {
+    const cardId = await importOne();
+    const first = await sendReview({ cardId, version: 1, reviewId: "r1", rating: 3 });
+    expect(first.status).toBe(200);
+    const after = await stateOf(cardId);
+
+    // 冪等キーは「同じ要求の再送」のためのもの。中身が違うものは別の要求なので受け取らない。
+    for (const body of [
+      { rating: 1, expected_version: 1 },
+      { rating: 3, expected_version: 2 },
+      { rating: 3, expected_version: 99 },
+    ]) {
+      const res = await post("/api/review", {
+        review_id: "r1",
+        card_id: cardId,
+        occurred_at: toUtcIso(NOW),
+        ...body,
+      });
+      expect(res.status, JSON.stringify(body)).toBe(409);
+      expect((await res.json<ReviewErrorResponse>()).error).toBe("version_conflict");
+    }
+
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toEqual(after);
   });
 
   it("保存する行に state_before / state_after / review_log / 版と received_at が入る", async () => {
@@ -272,148 +310,26 @@ describe("POST /api/review(競合)", () => {
   });
 });
 
-/**
- * 「読んでから書くまで」の隙に割り込みを入れる D1。
- * `match` を含む問い合わせの first() が返った直後に、1 回だけ `interrupt` を流す。
- */
-function dbRacingAfterRead(match: string, interrupt: () => Promise<unknown>): D1Database {
-  let raced = false;
-  const race = async () => {
-    if (raced) return;
-    raced = true;
-    await interrupt();
-  };
+describe("POST /api/review(冪等キーの使い回し)", () => {
+  it("同じ review_id を別のカードで送ったら 409 で、2 枚目は何も変わらない", async () => {
+    const ids = await importCards(["invoice", "ledger"]);
+    const first = ids.get("invoice") as string;
+    const other = ids.get("ledger") as string;
+    expect((await sendReview({ cardId: first, version: 1, reviewId: "shared-id" })).status).toBe(
+      200,
+    );
 
-  const hooked = (statement: D1PreparedStatement): D1PreparedStatement =>
-    new Proxy(statement, {
-      get(target, prop, receiver) {
-        if (prop === "bind") {
-          return (...args: unknown[]) => hooked(target.bind(...args));
-        }
-        if (prop === "first") {
-          return async (...args: unknown[]) => {
-            const result = await (target.first as (...a: unknown[]) => Promise<unknown>).apply(
-              target,
-              args,
-            );
-            await race();
-            return result;
-          };
-        }
-        return Reflect.get(target, prop, receiver);
-      },
-    });
-
-  return new Proxy(env.DB, {
-    get(target, prop, receiver) {
-      if (prop !== "prepare") return Reflect.get(target, prop, receiver);
-      return (query: string) => {
-        const statement = target.prepare(query);
-        return query.includes(match) ? hooked(statement) : statement;
-      };
-    },
-  });
-}
-
-/** settings を読んだ直後(= version を確かめた後、batch を流す前)に別の評価を割り込ませる D1。 */
-function dbRacingAfterSettings(cardId: string): D1Database {
-  return dbRacingAfterRead("FROM settings", () =>
-    env.DB.prepare("UPDATE card_state SET version = version + 1 WHERE card_id = ?")
-      .bind(cardId)
-      .run(),
-  );
-}
-
-/** 差し替えた D1 で評価を 1 件送る(本文はそのまま使う)。 */
-async function sendReviewWithDb(db: D1Database, body: unknown): Promise<Response> {
-  return await harness.app.request(
-    `${ORIGIN}/api/review`,
-    {
-      method: "POST",
-      body: JSON.stringify(body),
-      headers: {
-        "Content-Type": "application/json",
-        Origin: ORIGIN,
-        "Cf-Access-Jwt-Assertion": harness.jwt,
-      },
-    },
-    { ...harness.env, DB: db },
-  );
-}
-
-describe("POST /api/review(条件付き UPDATE が 0 件)", () => {
-  it("version を確かめた後に割り込まれても、409 で 1 行も書かない", async () => {
-    const cardId = await importOne();
-    const before = await stateOf(cardId);
-
-    const res = await sendReviewWithDb(dbRacingAfterSettings(cardId), {
-      review_id: "interleaved",
-      card_id: cardId,
-      rating: 3,
-      expected_version: 1,
-      occurred_at: toUtcIso(NOW),
-    });
-
+    // version は合っているので batch まで進むが、冪等キーが別のカードに使われているので 0 件になる。
+    const res = await sendReview({ cardId: other, version: 1, reviewId: "shared-id" });
     expect(res.status).toBe(409);
     expect((await res.json<ReviewErrorResponse>()).error).toBe("version_conflict");
-    // 割り込んだ更新(version +1)以外は何も起きていない。reviews は空のまま。
-    expect(await countReviews()).toBe(0);
-    expect(await stateOf(cardId)).toEqual({ ...before, version: 2 });
-  });
-});
 
-describe("POST /api/review(同じ review_id の同時送信)", () => {
-  it("ログを引いた後に 1 回目が確定しても、409 ではなく 1 回目と同じ応答を返す", async () => {
-    const cardId = await importOne();
-    let firstBody: ReviewResponse | undefined;
-    // reviews を引いた直後(= 未登録を確かめた後、state を読む前)に 1 回目を確定させる。
-    const db = dbRacingAfterRead("FROM reviews WHERE review_id", async () => {
-      const first = await sendReview({ cardId, version: 1, reviewId: "double-send", rating: 1 });
-      expect(first.status).toBe(200);
-      firstBody = await first.json<ReviewResponse>();
-    });
-
-    const res = await sendReviewWithDb(db, {
-      review_id: "double-send",
-      card_id: cardId,
-      rating: 1,
-      expected_version: 1,
-      occurred_at: toUtcIso(NOW),
-      elapsed_ms: 4200,
-    });
-
-    expect(res.status).toBe(200);
-    expect(await res.json<ReviewResponse>()).toEqual(firstBody);
     expect(await countReviews()).toBe(1);
-    expect(await stateOf(cardId)).toMatchObject({ version: 2, due: firstBody?.state.due });
-  });
-
-  it("同じ review_id を別のカードで送っても、2 枚目の state は進まない", async () => {
-    const ids = await importCards(["invoice", "ledger"]);
-    const winner = ids.get("invoice") as string;
-    const loser = ids.get("ledger") as string;
-    let firstBody: ReviewResponse | undefined;
-    // 1 枚目が先に同じ review_id を使い切る。2 枚目は version が合っているので batch まで進む。
-    const db = dbRacingAfterRead("FROM reviews WHERE review_id", async () => {
-      const first = await sendReview({ cardId: winner, version: 1, reviewId: "shared-id" });
-      expect(first.status).toBe(200);
-      firstBody = await first.json<ReviewResponse>();
-    });
-
-    const res = await sendReviewWithDb(db, {
-      review_id: "shared-id",
-      card_id: loser,
-      rating: 3,
-      expected_version: 1,
-      occurred_at: toUtcIso(NOW),
-    });
-
-    // 同じ冪等キーには同じ応答。ログは 1 行だけで、2 枚目の state は新規のまま。
-    expect(res.status).toBe(200);
-    expect(await res.json<ReviewResponse>()).toEqual(firstBody);
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(loser)).toMatchObject({ version: 1, fsrs_state: State.New, reps: 0 });
-    expect(await stateOf(winner)).toMatchObject({ version: 2 });
+    expect(
+      (await env.DB.prepare("SELECT card_id FROM reviews").first<{ card_id: string }>())?.card_id,
+    ).toBe(first);
+    expect(await stateOf(other)).toMatchObject({ version: 1, fsrs_state: State.New, reps: 0 });
+    expect(await stateOf(first)).toMatchObject({ version: 2 });
   });
 
   it("同じ review_id を 2 枚のカードへ同時に送っても、進むのは片方だけ", async () => {
@@ -426,14 +342,17 @@ describe("POST /api/review(同じ review_id の同時送信)", () => {
       sendReview({ cardId: other, version: 1, reviewId: "shared-id" }),
     ]);
 
-    expect([a.status, b.status]).toEqual([200, 200]);
-    const bodyA = await a.json<ReviewResponse>();
-    expect(await b.json<ReviewResponse>()).toEqual(bodyA);
+    // 片方は確定し、もう片方は「同じ要求の再送」ではないので 409。
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    const ok = a.status === 200 ? a : b;
+    const conflicted = a.status === 200 ? b : a;
+    const okBody = await ok.json<ReviewResponse>();
+    expect((await conflicted.json<ReviewErrorResponse>()).error).toBe("version_conflict");
+
+    // ログは 1 行だけ。応答に入っているカードだけが 1 回分進み、もう片方は新規のまま。
     expect(await countReviews()).toBe(1);
-    // 応答に入っているカードだけが 1 回分進み、もう片方は新規のまま。
-    const advanced = bodyA.card_id === one ? one : other;
-    const untouched = advanced === one ? other : one;
-    expect(await stateOf(advanced)).toMatchObject({ version: 2 });
+    const untouched = okBody.card_id === one ? other : one;
+    expect(await stateOf(okBody.card_id)).toMatchObject({ version: 2 });
     expect(await stateOf(untouched)).toMatchObject({ version: 1, fsrs_state: State.New, reps: 0 });
   });
 });

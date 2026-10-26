@@ -109,6 +109,26 @@ function reviewResponse(params: {
   };
 }
 
+/** 保存済みの行の version_before(0003 より前に入った行は state_before から読む)。 */
+function versionBefore(row: ReviewRow): number | null {
+  if (row.version_before !== null) return row.version_before;
+  const before = JSON.parse(row.state_before) as Partial<CardStateRow>;
+  return before.version ?? null;
+}
+
+/**
+ * 保存済みのログが「この要求そのもの」か(= 再送か)。
+ * 冪等キーは同じ要求の再送のためにあるので、カード・評価・前提の version まで一致したときだけ
+ * 1 回目の結果を返してよい。同じ review_id で中身が違うものは別の要求なので 409 にする。
+ */
+function isSameRequest(row: ReviewRow, request: ReviewRequest): boolean {
+  return (
+    row.card_id === request.card_id &&
+    row.rating === request.rating &&
+    versionBefore(row) === request.expected_version
+  );
+}
+
 /** 保存済みの行から応答を作り直す(再送に返す)。 */
 function replayResponse(row: ReviewRow): ReviewResponse {
   return reviewResponse({
@@ -123,10 +143,13 @@ function replayResponse(row: ReviewRow): ReviewResponse {
 /**
  * POST /api/review — 評価を 1 件確定する。
  *
- * - `review_id` で冪等。同じ id の再送には 1 回目とまったく同じ応答を返し、reviews も state も変えない
- *   (同時送信で 1 回目が途中に割り込んだ場合も、409 ではなく 1 回目の結果を返す)。
+ * - `review_id` で冪等。同じ要求の再送には 1 回目とまったく同じ応答を返し、reviews も state も
+ *   変えない(同時に 2 本来ても両方 1 回目の結果になる)。同じ `review_id` で中身が違うもの
+ *   (別のカード・別の評価・別の `expected_version`)は再送ではないので 409。
  * - `expected_version` が今の card_state.version と違えば 409(何も変えない)。
- * - 成功時は 1 つの batch で「reviews の INSERT + 条件付き UPDATE」を流し、UPDATE が 0 件なら 409。
+ * - 書き込みは 1 つの batch で「reviews の INSERT + 条件付き UPDATE」。0 件だったときの
+ *   「再送か 409 か」の最終判定は、読んだ時点の値ではなく batch の結果で行う
+ *   (`getReview` / `getCardState` を先に引くのは、無駄な計算を避けるための補助)。
  * - FSRS の計算は純関数(`applyReview`)に任せ、ここは HTTP と D1 の面倒だけを見る。
  */
 export const postReview: Handler<AppEnv> = async (c) => {
@@ -141,9 +164,9 @@ export const postReview: Handler<AppEnv> = async (c) => {
   if (!parsed.request) return c.json(failure(parsed.error.code, parsed.error.message), 400);
   const request: ReviewRequest = parsed.request;
 
-  // 再送なら 1 回目の結果をそのまま返す(計算も書き込みもしない)。
+  // 再送だと分かっていれば 1 回目の結果をそのまま返す(計算も書き込みもしない)。
   const replayed = await getReview(c.env.DB, request.review_id);
-  if (replayed) return c.json(replayResponse(replayed), 200);
+  if (replayed && isSameRequest(replayed, request)) return c.json(replayResponse(replayed), 200);
 
   const card = await getCard(c.env.DB, request.card_id);
   if (!card) return c.json(failure("card_not_found", "そのカードは無い"), 404);
@@ -151,10 +174,10 @@ export const postReview: Handler<AppEnv> = async (c) => {
   if (!state) return c.json(failure("card_not_found", "そのカードの FSRS 状態が無い"), 404);
 
   if (state.version !== request.expected_version) {
-    // ログを引いてから state を読むまでに、同じ review_id の 1 回目が確定していることがある。
-    // その場合は version のずれではなく再送なので、1 回目の結果を返す。
+    // ログを引いてから state を読むまでに、同じ要求の 1 回目が確定していることがある
+    // (同時に 2 本送られた場合)。それは version のずれではなく再送なので 1 回目の結果を返す。
     const raced = await getReview(c.env.DB, request.review_id);
-    if (raced) return c.json(replayResponse(raced), 200);
+    if (raced && isSameRequest(raced, request)) return c.json(replayResponse(raced), 200);
     return c.json(conflict(state), 409);
   }
 
@@ -187,9 +210,10 @@ export const postReview: Handler<AppEnv> = async (c) => {
   });
 
   if (!committed) {
-    // 読んでから書くまでに割り込まれた。同じ review_id が先に入っていたなら、それが 1 回目。
-    const raced = await getReview(c.env.DB, request.review_id);
-    if (raced) return c.json(replayResponse(raced), 200);
+    // batch は 1 行も書いていない(ログも state もそのまま)。ここが最終判定:
+    // 同じ要求のログが既にあるならそれが 1 回目なので冪等応答、そうでなければ競合。
+    const stored = await getReview(c.env.DB, request.review_id);
+    if (stored && isSameRequest(stored, request)) return c.json(replayResponse(stored), 200);
     const current = await getCardState(c.env.DB, request.card_id);
     return c.json(conflict(current ?? state), 409);
   }
