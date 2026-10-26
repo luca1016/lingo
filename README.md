@@ -17,6 +17,8 @@ GitHub luca1016/lingo
               Worker: run_worker_first: true
                 /api/health        認証外(版情報のみ)
                 それ以外すべて      Access JWT 検証(署名・issuer・aud・期限・email)→ API(Hono)/ 静的アセット(Vite の dist/)
+                拒否の返し方        /api/* は 401(画面が再ログインを案内する)、それ以外は 403。
+                                   設定(vars)欠落は再ログインでは直らないので常に 403
                 D1: 本番 lingo-db / 非本番 lingo-db-preview
 ```
 

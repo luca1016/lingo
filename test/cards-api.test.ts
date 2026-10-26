@@ -355,7 +355,7 @@ describe("POST /api/cards(上限と形)", () => {
 });
 
 describe("POST /api/cards(ガード)", () => {
-  it("Access JWT が無ければ 403", async () => {
+  it("Access JWT が無ければ 401(API 経路の認証切れ)", async () => {
     const res = await harness.app.request(
       `${ORIGIN}/api/cards`,
       {
@@ -365,7 +365,8 @@ describe("POST /api/cards(ガード)", () => {
       },
       harness.env,
     );
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
+    expect((await res.json<{ error: string }>()).error).toBe("unauthenticated");
     expect(await counts()).toEqual({ cards: 0, states: 0, imports: 0 });
   });
 

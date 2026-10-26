@@ -426,7 +426,7 @@ describe("POST /api/review(入力の検証とガード)", () => {
     expect(await stateOf(cardId)).toMatchObject({ version: 1 });
   });
 
-  it("Access JWT が無い / 別 Origin / JSON でないなら書かない", async () => {
+  it("Access JWT が無い(401)/ 別 Origin / JSON でないなら書かない", async () => {
     const cardId = await importOne();
     const body = {
       review_id: "guarded",
@@ -445,7 +445,9 @@ describe("POST /api/review(入力の検証とガード)", () => {
       },
       harness.env,
     );
-    expect(noJwt.status).toBe(403);
+    // 認証切れは画面が判別できるように 401(再ログインを案内して再送をやめるため)。
+    expect(noJwt.status).toBe(401);
+    expect((await noJwt.json<{ error: string }>()).error).toBe("unauthenticated");
 
     const crossOrigin = await harness.app.request(
       `${ORIGIN}/api/review`,
@@ -480,9 +482,10 @@ describe("POST /api/review(入力の検証とガード)", () => {
     expect(await countReviews()).toBe(0);
   });
 
-  it("GET /api/due も Access JWT が無ければ 403", async () => {
+  it("GET /api/due も Access JWT が無ければ 401", async () => {
     const res = await harness.app.request(`${ORIGIN}/api/due`, {}, harness.env);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
+    expect((await res.json<{ error: string }>()).error).toBe("unauthenticated");
   });
 });
 
@@ -619,6 +622,57 @@ describe("GET /api/due(短期再出題)", () => {
     expect((await due()).cards).toEqual([]);
     vi.setSystemTime(new Date(NOW.getTime() + 10 * MINUTE));
     expect((await due()).cards.map((c) => c.queue)).toEqual(["learning"]);
+  });
+});
+
+// next_due_at: 出せるカードが無いときに画面がカウントダウンを出すための時刻。
+describe("GET /api/due(next_due_at)", () => {
+  it("出すものが何も無ければ null", async () => {
+    expect((await due()).next_due_at).toBeNull();
+    // 新規カードは期限を持たない(出せるので cards に入る)。
+    await importOne();
+    const body = await due();
+    expect(body.cards).toHaveLength(1);
+    expect(body.next_due_at).toBeNull();
+  });
+
+  it("学習ステップ待ちのカードの期限を返す(cards は空)", async () => {
+    const cardId = await importOne();
+    expect((await sendReview({ cardId, version: 1, rating: 1 })).status).toBe(200);
+
+    const body = await due();
+    expect(body.cards).toEqual([]);
+    expect(body.next_due_at).toBe(toUtcIso(new Date(NOW.getTime() + MINUTE)));
+
+    // 期限が来たら cards に出て、未来の期限は無くなる。
+    vi.setSystemTime(new Date(NOW.getTime() + MINUTE));
+    const after = await due();
+    expect(after.cards.map((c) => c.card_id)).toEqual([cardId]);
+    expect(after.next_due_at).toBeNull();
+  });
+
+  it("未来の期限のうちいちばん早いものを返す(復習も数える)", async () => {
+    const ids = await importCards(["learning", "review", "far"]);
+    await setState(
+      ids.get("learning") as string,
+      State.Learning,
+      new Date(NOW.getTime() + 2 * MINUTE),
+    );
+    await setState(ids.get("review") as string, State.Review, new Date(NOW.getTime() + MINUTE));
+    await setState(ids.get("far") as string, State.Review, new Date(NOW.getTime() + 60 * MINUTE));
+
+    expect((await due()).next_due_at).toBe(toUtcIso(new Date(NOW.getTime() + MINUTE)));
+  });
+
+  it("論理削除したカードは数えない", async () => {
+    const cardId = await importOne();
+    await setState(cardId, State.Learning, new Date(NOW.getTime() + MINUTE));
+    expect((await due()).next_due_at).toBe(toUtcIso(new Date(NOW.getTime() + MINUTE)));
+
+    await env.DB.prepare("UPDATE cards SET deleted_at = ? WHERE id = ?")
+      .bind(toUtcIso(NOW), cardId)
+      .run();
+    expect((await due()).next_due_at).toBeNull();
   });
 });
 

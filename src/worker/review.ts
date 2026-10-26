@@ -23,6 +23,7 @@ import {
   getReview,
   getSettings,
   listDueCards,
+  nextDueAt,
   type ReviewRow,
 } from "./db";
 import { applyReview, toReviewState } from "./fsrs";
@@ -86,6 +87,8 @@ export const getDue: Handler<AppEnv> = async (c) => {
     now: toUtcIso(now),
     limit,
     cards,
+    // 空のときのカウントダウン用。期限が来ているものは cards に出るので、見るのは未来だけ。
+    next_due_at: await nextDueAt(c.env.DB, { now }),
     new_today: newToday,
     new_remaining: newRemaining,
   };

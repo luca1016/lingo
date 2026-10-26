@@ -54,6 +54,26 @@ export async function listDueCards(
 }
 
 /**
+ * 次に期限が来る時刻(学習中・復習のうち、いまより先でいちばん早い `due`)。無ければ null。
+ * 出せるカードが無いときのカウントダウンに使う(新規は期限を持たないので数えない)。
+ */
+export async function nextDueAt(
+  db: D1Database,
+  params: { now: Date; deckId?: string },
+): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT MIN(s.due) AS due
+         FROM card_state s JOIN cards c ON c.id = s.card_id
+        WHERE c.deck_id = ? AND c.deleted_at IS NULL
+          AND s.fsrs_state IN (1, 2, 3) AND s.due > ?`,
+    )
+    .bind(params.deckId ?? DEFAULT_DECK_ID, toUtcIso(params.now))
+    .first<{ due: string | null }>();
+  return row?.due ?? null;
+}
+
+/**
  * その範囲(`start` 以上 `end` 未満)に初回評価を確定したカードのユニーク枚数。
  * 1 枚のカードを何回評価しても 1 枚と数える(新規上限の消費量)。
  */

@@ -15,6 +15,7 @@ import {
   submitDraft,
 } from "./draft";
 import { buildPreview, canImport } from "./preview";
+import { Review } from "./Review";
 
 const page = { fontFamily: "system-ui, sans-serif", padding: "16px", maxWidth: "640px" };
 const field = { display: "block", width: "100%", boxSizing: "border-box", padding: "8px" } as const;
@@ -24,13 +25,19 @@ const row = { borderBottom: "1px solid #ddd", padding: "6px 0", fontSize: "14px"
 const ng = { color: "#b00020" };
 const warn = { color: "#8a6d00" };
 
-type Mode = "single" | "paste";
+type Mode = "single" | "paste" | "review";
 
 /** 草稿を更新する(useState の setter をそのまま渡す)。 */
 type SetDraft = (next: Draft | ((prev: Draft) => Draft)) => void;
 
 const EMPTY_CARD: DraftContent = { front: "", back: "", example: "", note: "" };
 const EMPTY_PASTE: DraftContent = { text: "" };
+
+const TABS: [Mode, string][] = [
+  ["single", "単票追加"],
+  ["paste", "貼り付け取り込み"],
+  ["review", "復習"],
+];
 
 export function App() {
   const [mode, setMode] = useState<Mode>("single");
@@ -40,27 +47,24 @@ export function App() {
   const [showErrors, setShowErrors] = useState(false);
   const [paste, setPaste] = useState(() => newDraft(EMPTY_PASTE));
   const [previewed, setPreviewed] = useState<string | null>(null);
+  // 復習の状態(表示中の 1 枚・未確定の送信)は review.ts のストアが持つ。
+  // コンポーネントの外にあるので、タブを往復して作り直されても送信状態と再送キーは失われない。
 
   return (
     <main style={page}>
       <h1>lingo</h1>
       <nav style={{ display: "flex", gap: "8px" }}>
-        <button
-          type="button"
-          style={button}
-          disabled={mode === "single"}
-          onClick={() => setMode("single")}
-        >
-          単票追加
-        </button>
-        <button
-          type="button"
-          style={button}
-          disabled={mode === "paste"}
-          onClick={() => setMode("paste")}
-        >
-          貼り付け取り込み
-        </button>
+        {TABS.map(([value, text]) => (
+          <button
+            key={value}
+            type="button"
+            style={button}
+            disabled={mode === value}
+            onClick={() => setMode(value)}
+          >
+            {text}
+          </button>
+        ))}
       </nav>
       {mode === "single" ? (
         <SingleCard
@@ -69,13 +73,15 @@ export function App() {
           showErrors={showErrors}
           setShowErrors={setShowErrors}
         />
-      ) : (
+      ) : mode === "paste" ? (
         <PasteImport
           draft={paste}
           setDraft={setPaste}
           previewed={previewed}
           setPreviewed={setPreviewed}
         />
+      ) : (
+        <Review />
       )}
     </main>
   );

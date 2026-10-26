@@ -62,6 +62,11 @@ export interface DueResponse {
   limit: number;
   /** 学習中 → 復習 → 新規の順。 */
   cards: DueCard[];
+  /**
+   * 次に期限が来る時刻(学習中・復習のうち最も近い未来の `due`)。無ければ null。
+   * `cards` が空のとき、画面が「つぎのカードまで」の待ち時間を出すために使う。
+   */
+  next_due_at: string | null;
   /** その日(settings の timezone)に初回評価を確定したユニーク枚数。 */
   new_today: number;
   /** その日あと何枚の新規を出せるか。 */
