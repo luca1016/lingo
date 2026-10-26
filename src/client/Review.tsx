@@ -69,7 +69,7 @@ export function Review({ session, setSession }: { session: Session; setSession: 
       <h2>復習</h2>
       <p>
         残り {left} 枚
-        {session.newRemaining !== null ? `(新規はあとで ${session.newRemaining} 枚出せる)` : ""}
+        {session.newRemaining !== null ? ` / 今日の新規はあと ${session.newRemaining} 枚` : ""}
       </p>
       {session.notice ? <p style={warn}>{session.notice}</p> : null}
 
@@ -111,7 +111,8 @@ export function Review({ session, setSession }: { session: Session; setSession: 
         <p>読み込み中…</p>
       ) : waitUntil ? (
         <p>つぎのカードまで あと {formatWait(waitUntil.getTime() - now.getTime())}</p>
-      ) : (
+      ) : session.failure ? // 取れなかっただけなので「無い」とは言わない(理由と取り直しは下の節で出す)。
+      null : (
         <>
           <p>いま出すカードは無い</p>
           <button type="button" style={button} onClick={() => void loadDue(session, setSession)}>
