@@ -96,16 +96,22 @@ async function send(
   setState: (next: SendState) => void,
 ): Promise<boolean> {
   setState({ ...IDLE, sending: true });
-  const res = await postCards(importId, cards);
-  if (res.ok) {
-    setState({ ...IDLE, result: res.response });
-    return true;
+  try {
+    const res = await postCards(importId, cards);
+    if (res.ok) {
+      setState({ ...IDLE, result: res.response });
+      return true;
+    }
+    setState({
+      ...IDLE,
+      failure: `${res.error.message}(${res.error.error})`,
+      errors: res.error.errors ?? [],
+    });
+  } catch (cause) {
+    // postCards は例外を出さない作りだが、万一出ても送信中のまま固まらせない
+    //(import_id と入力は呼び出し側が保持しているので、そのまま再送できる)。
+    setState({ ...IDLE, failure: `送信できなかった(${String(cause)})` });
   }
-  setState({
-    ...IDLE,
-    failure: `${res.error.message}(${res.error.error})`,
-    errors: res.error.errors ?? [],
-  });
   return false;
 }
 
