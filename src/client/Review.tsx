@@ -6,6 +6,7 @@ import { RATINGS, type ReviewRating } from "../shared/review";
 import {
   currentCard,
   formatWait,
+  isRevealed,
   loadDue,
   nextDueAt,
   rate,
@@ -79,7 +80,8 @@ export function Review({ session, setSession }: { session: Session; setSession: 
       {card ? (
         <article>
           <p style={front}>{card.front}</p>
-          {session.revealed ? (
+          {/* 裏と評価ボタンは、めくったカード自身にだけ付ける(別のカードには付け替わらない)。 */}
+          {isRevealed(session, card) ? (
             <>
               <p style={back}>{card.back}</p>
               {card.example ? <p style={sub}>{card.example}</p> : null}
@@ -104,7 +106,7 @@ export function Review({ session, setSession }: { session: Session; setSession: 
               type="button"
               style={button}
               disabled={session.sending}
-              onClick={() => setSession((prev) => reveal(prev))}
+              onClick={() => setSession((prev) => reveal(prev, card))}
             >
               めくる
             </button>

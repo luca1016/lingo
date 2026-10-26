@@ -561,6 +561,47 @@ describe("復習画面(短期カード)", () => {
     expect(await stateOf(cardId)).toMatchObject({ version: 3 });
   });
 
+  it("めくったカードは、別のカードの期限が来ても入れ替わらない", async () => {
+    connect();
+    const ids = await importCards(["invoice", "ledger"]);
+    const order = (await serverDue()).cards.map((c) => c.front);
+    const [slow, quick] = order as [string, string];
+    const slowId = ids.get(slow) as string;
+    const quickId = ids.get(quick) as string;
+
+    // 1 枚目は Good(10 分待ち)、2 枚目は Again(1 分待ち)。待ち行列の並びは [1 枚目, 2 枚目]
+    // のままなので、期限の順(2 枚目 → 1 枚目)と一致しない。
+    const s = await openReview();
+    expect(s.text()).toContain(slow);
+    await answer(s, "Good");
+    expect(s.text()).toContain(quick);
+    await answer(s, "Again");
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+
+    // 1 分後: 期限が来た 2 枚目が出る。めくる。
+    vi.advanceTimersByTime(MINUTE);
+    await flush();
+    expect(s.text()).toContain(quick);
+    await click(buttonByText(s.root, "めくる"));
+    expect(s.text()).toContain(`${quick} の意味`);
+
+    // さらに時間が経って 1 枚目の期限も来るが、めくった 2 枚目のまま
+    //(1 枚目の裏と評価ボタンが出て、2 枚目のつもりの評価が 1 枚目に入る、ということがない)。
+    vi.advanceTimersByTime(9 * MINUTE);
+    await flush();
+    expect(s.text()).toContain(`${quick} の意味`);
+    expect(s.text()).not.toContain(slow);
+    expect(s.ratings().map((b) => b.disabled)).toEqual([false, false, false, false]);
+
+    await click(buttonByText(s.root, "Good"));
+    expect(reviewBodies().at(-1)).toMatchObject({ card_id: quickId, expected_version: 2 });
+    expect(await stateOf(quickId)).toMatchObject({ version: 3 });
+    // 1 枚目は評価されていない。確定したあとに、期限の来ている 1 枚目が出る。
+    expect(await stateOf(slowId)).toMatchObject({ version: 2 });
+    expect(s.text()).toContain(slow);
+    expect(s.has("めくる")).toBe(true);
+  });
+
   it("長い間隔のカードは手元に残さない(次に取り直したときサーバが出す)", async () => {
     connect();
     const cardId = await importOne();

@@ -8,6 +8,8 @@
 //  - 409(version_conflict)は端末の持っている version が古いだけなので、due を取り直して続ける。
 //  - 認証切れ(401)はログインし直すまで何を送っても通らないので、再送をやめて案内だけ出す。
 //  - 短期カード(学習ステップ)は due を手元に持ち、時間が来たら同じ画面で出し直す。
+//  - 出しているカードは勝手に入れ替えない。めくった 1 枚は card_id を持って固定し(revealed)、
+//    待ち行列の別のカードの期限が来ても、裏と評価ボタンがそのカードに付け替わらない。
 //  - 取得(GET /api/due)には世代番号を付け、応答が返った時点で最新世代でなければ結果を捨てる。
 //    画面の状態は「いまの状態(prev)」から作り直す(更新関数で渡す)ので、遅れて返ってきた取得が
 //    送信状態・再送キー・短期カードを巻き戻すことがない。
@@ -46,13 +48,21 @@ export interface QueuedCard {
   due: string;
 }
 
-export interface Session {
-  /** 残っているカード(先頭から見て、出せるものを 1 枚出す)。 */
-  queue: QueuedCard[];
-  /** 裏までめくったか。 */
-  revealed: boolean;
+/**
+ * めくった 1 枚。どのカードをめくったのか(card_id)と、いつめくったのかを組で持つ。
+ * 表示・評価の対象はこのカードに固定される(時間が経って別のカードの期限が来ても動かない)。
+ */
+export interface Revealed {
+  cardId: string;
   /** めくった時刻(ms)。評価までの時間を elapsed_ms に入れる。 */
-  revealedAt: number | null;
+  at: number;
+}
+
+export interface Session {
+  /** 残っているカード(この中から 1 枚出す)。 */
+  queue: QueuedCard[];
+  /** 裏までめくった 1 枚(めくっていなければ null)。 */
+  revealed: Revealed | null;
   /** 送信中。 */
   sending: boolean;
   /** 送った(送ろうとした)1 件。失敗しても残すので同じ review_id で再送できる。 */
@@ -80,8 +90,7 @@ export type SetSession = (update: (prev: Session) => Session) => void;
 export function newSession(): Session {
   return {
     queue: [],
-    revealed: false,
-    revealedAt: null,
+    revealed: null,
     sending: false,
     attempt: null,
     failure: null,
@@ -139,9 +148,33 @@ export function mergeQueue(
   return [...fromServer, ...waiting];
 }
 
-/** いま出せるカード(先頭から見て期限が来ている最初の 1 枚)。無ければ null。 */
+/**
+ * いま出すカード。無ければ null。
+ *
+ * めくった 1 枚は、評価が確定する(または取り直しでめくり状態が消える)まで出し続ける。
+ * めくっていないときは、期限が来ているもののうち期限がいちばん早い 1 枚を出す。
+ * こうしておくと、時間が経って別のカードの期限が来ても出しているカードは変わらない
+ *(あとから期限が来るカードの due は、いま出している 1 枚の due より必ず後ろなので)。
+ * 待ち行列の並び順(= サーバが出した順 + 手元の短期カード)と期限の順は一致しないので、
+ * 「先頭から最初に期限が来ている 1 枚」だと、別のカードに勝手に入れ替わることがある。
+ */
 export function currentCard(session: Session, now: Date): QueuedCard | null {
-  return session.queue.find((q) => Date.parse(q.due) <= now.getTime()) ?? null;
+  const pinned = session.revealed
+    ? session.queue.find((q) => q.cardId === session.revealed?.cardId)
+    : undefined;
+  if (pinned) return pinned;
+  let earliest: QueuedCard | null = null;
+  for (const q of session.queue) {
+    const due = Date.parse(q.due);
+    if (due > now.getTime()) continue;
+    if (earliest === null || due < Date.parse(earliest.due)) earliest = q;
+  }
+  return earliest;
+}
+
+/** その 1 枚の裏を出しているか(裏と評価ボタンは、めくったカードにだけ付ける)。 */
+export function isRevealed(session: Session, card: QueuedCard): boolean {
+  return session.revealed?.cardId === card.cardId;
 }
 
 /** 出せるカードが無いとき、次に出せる時刻(= 短期カードの待ち)。 */
@@ -164,16 +197,17 @@ export function formatWait(ms: number): string {
   return minutes > 0 ? `${minutes} 分 ${seconds} 秒` : `${seconds} 秒`;
 }
 
-/** 裏をめくる(送信中・認証切れのときは何もしない)。 */
-export function reveal(session: Session, now: Date = new Date()): Session {
+/** その 1 枚の裏をめくる(送信中・認証切れ、手元に無いカードのときは何もしない)。 */
+export function reveal(session: Session, card: QueuedCard, now: Date = new Date()): Session {
   if (session.sending || session.authExpired || session.revealed) return session;
-  return { ...session, revealed: true, revealedAt: now.getTime() };
+  if (!session.queue.some((q) => q.cardId === card.cardId)) return session;
+  return { ...session, revealed: { cardId: card.cardId, at: now.getTime() } };
 }
 
 /** めくってから評価までの時間(測れなければ null)。 */
 function elapsedMsOf(session: Session, now: Date): number | null {
-  if (session.revealedAt === null) return null;
-  return Math.max(0, now.getTime() - session.revealedAt);
+  if (session.revealed === null) return null;
+  return Math.max(0, now.getTime() - session.revealed.at);
 }
 
 /** その失敗は同じ review_id で再送できるか。 */
@@ -236,8 +270,7 @@ export async function loadDue(
     ...prev,
     loading: false,
     queue: mergeQueue(prev.queue, res.response.cards, now, prev.attempt?.cardId ?? null),
-    revealed: false,
-    revealedAt: null,
+    revealed: null,
     newRemaining: res.response.new_remaining,
   }));
 }
@@ -269,7 +302,8 @@ function attemptFor(session: Session, card: QueuedCard, rating: ReviewRating, no
 
 /**
  * いま出ている 1 枚に評価をつけて確定する。同じ評価を押し直した再送は同じ review_id で送る。
- * 対象のカードは画面が見ているものをそのまま受け取る(時計のずれで別の 1 枚を送らないため)。
+ * 対象のカードは画面が見ているものをそのまま受け取り、めくった 1 枚と一致しなければ送らない
+ *(裏を見ていないカードに評価が入らないため)。
  */
 export async function rate(
   session: Session,
@@ -278,7 +312,8 @@ export async function rate(
   set: SetSession,
   now: Date = new Date(),
 ): Promise<void> {
-  if (session.sending || session.loading || session.authExpired || !session.revealed) return;
+  if (session.sending || session.loading || session.authExpired) return;
+  if (!isRevealed(session, card)) return;
   const inQueue = session.queue.some((q) => q.cardId === card.cardId && q.version === card.version);
   if (!inQueue) return;
   await send(session, attemptFor(session, card, rating, now), set, now);
@@ -345,8 +380,7 @@ function advance(
       reviewed && shortTerm
         ? [...rest, { ...reviewed, version: state.version, due: state.due }]
         : rest,
-    revealed: false,
-    revealedAt: null,
+    revealed: null,
     sending: false,
     attempt: null,
     failure: null,
