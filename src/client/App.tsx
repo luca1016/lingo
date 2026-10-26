@@ -26,8 +26,21 @@ const warn = { color: "#8a6d00" };
 
 type Mode = "single" | "paste";
 
+/** 草稿を更新する(useState の setter をそのまま渡す)。 */
+type SetDraft = (next: Draft | ((prev: Draft) => Draft)) => void;
+
+const EMPTY_CARD: DraftContent = { front: "", back: "", example: "", note: "" };
+const EMPTY_PASTE: DraftContent = { text: "" };
+
 export function App() {
   const [mode, setMode] = useState<Mode>("single");
+  // 草稿(入力内容と import_id の組)は App が持つ。画面を切り替えても消えないので、
+  // 送信中や応答が消えたあとにタブを往復しても、同じ内容・同じキーで再送して結果を確認できる。
+  const [single, setSingle] = useState(() => newDraft(EMPTY_CARD));
+  const [showErrors, setShowErrors] = useState(false);
+  const [paste, setPaste] = useState(() => newDraft(EMPTY_PASTE));
+  const [previewed, setPreviewed] = useState<string | null>(null);
+
   return (
     <main style={page}>
       <h1>lingo</h1>
@@ -49,7 +62,21 @@ export function App() {
           貼り付け取り込み
         </button>
       </nav>
-      {mode === "single" ? <SingleCard /> : <PasteImport />}
+      {mode === "single" ? (
+        <SingleCard
+          draft={single}
+          setDraft={setSingle}
+          showErrors={showErrors}
+          setShowErrors={setShowErrors}
+        />
+      ) : (
+        <PasteImport
+          draft={paste}
+          setDraft={setPaste}
+          previewed={previewed}
+          setPreviewed={setPreviewed}
+        />
+      )}
     </main>
   );
 }
@@ -97,11 +124,17 @@ function SendState({ draft }: { draft: Draft }) {
   );
 }
 
-const EMPTY_CARD: DraftContent = { front: "", back: "", example: "", note: "" };
-
-function SingleCard() {
-  const [draft, setDraft] = useState(() => newDraft(EMPTY_CARD));
-  const [showErrors, setShowErrors] = useState(false);
+function SingleCard({
+  draft,
+  setDraft,
+  showErrors,
+  setShowErrors,
+}: {
+  draft: Draft;
+  setDraft: SetDraft;
+  showErrors: boolean;
+  setShowErrors: (next: boolean) => void;
+}) {
   const values = draft.content;
   const local = normalizeRow(values, 1);
   const locked = isLocked(draft);
@@ -156,13 +189,19 @@ function SingleCard() {
   );
 }
 
-const EMPTY_PASTE: DraftContent = { text: "" };
-
-function PasteImport() {
-  const [draft, setDraft] = useState(() => newDraft(EMPTY_PASTE));
-  // プレビューした時点の文字列。いまの入力と一致しているあいだだけプレビューを出す
-  //(入力を変えたら import_id も変わるので、古いプレビューの内容を送らないようにする)。
-  const [previewed, setPreviewed] = useState<string | null>(null);
+// previewed はプレビューした時点の文字列。いまの入力と一致しているあいだだけプレビューを出す
+//(入力を変えたら import_id も変わるので、古いプレビューの内容を送らないようにする)。
+function PasteImport({
+  draft,
+  setDraft,
+  previewed,
+  setPreviewed,
+}: {
+  draft: Draft;
+  setDraft: SetDraft;
+  previewed: string | null;
+  setPreviewed: (next: string | null) => void;
+}) {
   const text = draft.content.text ?? "";
   const locked = isLocked(draft);
   const fresh = previewed !== null && previewed === text;
