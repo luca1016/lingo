@@ -48,6 +48,12 @@ export interface ReviewAttempt {
 /** 認証切れを表す status(worker の accessAuth が API 経路で返す)。 */
 const UNAUTHENTICATED = 401;
 
+/**
+ * 別版で弾かれたことを表す status。POST /api/review の失敗のうち、これだけが
+ * 「評価は入っていない」と確定できる(ほかは届いたか分からないので同じ review_id で再送する)。
+ */
+export const CONFLICT = 409;
+
 /** 結果が不明なときの案内(同じ review_id で再送すれば二重には記録されない)。 */
 export const RESEND_HINT = "同じ評価をもう一度送れる(二重には記録されない)";
 

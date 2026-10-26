@@ -19,8 +19,9 @@
 //  B. 取得(GET /api/due)の応答は sending / unresolved 中は反映せず `pending` に保留し、
 //     attempt が確定してから反映する。出している 1 枚は、期限の到来や新しい due の出現では
 //     入れ替わらない(入れ替わるのは評価が確定したときだけ)。
-//  C. attempt の確定は「200(成功または冪等)」か「409 / 404(別版・消失 → 取り直して出し直す)」
-//     だけ。通信失敗は unresolved に移り、ユーザーの操作で再送する。
+//  C. attempt の確定は「200(成功または冪等)」か「409(別版 → 取り直して出し直す)」だけ。
+//     それ以外(通信失敗・404・400 など)は確定していないので unresolved に移り、
+//     ユーザーの操作で再送する。
 //
 // 取得には世代番号(`generation`)を付ける。応答が返った時点で最新世代でなければ捨てる。
 // 世代は状態が持つので、タブを往復して画面が作り直されても続く。確定より前に始まった取得も
@@ -33,6 +34,7 @@ import {
   type ReviewState,
 } from "../shared/review";
 import {
+  CONFLICT,
   getDue,
   newReviewId,
   postReview,
@@ -397,7 +399,7 @@ function resolveSend(
 }
 
 /**
- * 409(別版)・404(消えた)で確定した。手元の version が古いと分かったので、
+ * 409(別版)で確定した。手元の version が古いと分かったので、
  * そのカードは落として取り直す(呼び出し側が `loadDue` する)。
  * 保留していた応答・進行中の取得もこの確定より前の内容なので使わない。
  */
@@ -484,11 +486,6 @@ export function formatWait(ms: number): string {
 
 function describe(error: ReviewApiError): string {
   return `${error.message}(${error.error})`;
-}
-
-/** その失敗は同じ attempt で再送できるか(= 結果が分からない)。 */
-function resendable(error: ReviewApiError): boolean {
-  return error.error === "network_error" || error.error === "server_error";
 }
 
 /**
@@ -611,17 +608,19 @@ async function send(session: Session, attempt: ReviewAttempt, set: SetSession): 
       dispatch(set, sending, { type: "auth_expired", generation: null });
       return;
     }
-    if (resendable(res.error)) {
-      dispatch(set, sending, { type: "send_unresolved", attempt, reason: describe(res.error) });
+    if (res.status === CONFLICT) {
+      // 409(別版)はここで確定。最新を取り直して出し直す(不変条件 C)。
+      // 進行中の古い取得に任せず force で取り直す(その応答は手元の確定より前の内容)。
+      const conflicted = dispatch(set, sending, { type: "send_conflicted", attempt });
+      await loadDue(conflicted.after, set, {
+        notice: `出し直した(${describe(res.error)})`,
+        force: true,
+      });
       return;
     }
-    // 409(別版)・404(消えた)はここで確定。最新を取り直して出し直す(不変条件 C)。
-    // 進行中の古い取得に任せず force で取り直す(その応答は手元の確定より前の内容)。
-    const conflicted = dispatch(set, sending, { type: "send_conflicted", attempt });
-    await loadDue(conflicted.after, set, {
-      notice: `出し直した(${describe(res.error)})`,
-      force: true,
-    });
+    // 200 / 409 以外では確定しない(不変条件 C)。404 や 400 でも attempt は捨てず、理由を出して
+    // ユーザーの再送に任せる(届いていたかどうかは分からないので、勝手に次へ進めない)。
+    dispatch(set, sending, { type: "send_unresolved", attempt, reason: describe(res.error) });
   } catch (cause) {
     // postReview は例外を出さない作りだが、万一出ても送信中のまま固まらせない。
     dispatch(set, sending, {

@@ -1013,3 +1013,71 @@ describe("復習画面(未確定の 1 件)", () => {
     expect(await countReviews()).toBe(2);
   });
 });
+
+// 不変条件 C: 確定するのは 200(冪等を含む)と 409 だけ。それ以外の応答では attempt を捨てない
+//(届いたかどうかが分からないので、次のカードへは進まない)。
+describe("復習画面(200 / 409 以外の応答)", () => {
+  it("404(カードが無い)でも attempt を保持し、別のカードには進まない", async () => {
+    connect();
+    const ids = await importCards(["invoice", "ledger"]);
+    const order = (await serverDue()).cards.map((c) => c.front);
+    const [a, b] = order as [string, string];
+    const aId = ids.get(a) as string;
+    const bId = ids.get(b) as string;
+
+    const s = await openReview();
+    expect(s.text()).toContain(a);
+
+    // 出している 1 枚を別の経路で論理削除する(POST /api/review は 404 になる)。
+    await env.DB.prepare("UPDATE cards SET deleted_at = ? WHERE id = ?")
+      .bind(toUtcIso(NOW), aId)
+      .run();
+
+    await answer(s, "Again");
+    expect(s.text()).toContain("card_not_found");
+    expect(s.has("同じ評価をもう一度送る")).toBe(true);
+
+    // 出ているのは A のまま。B は評価できない(不変条件 A)。
+    expect(s.text()).toContain(a);
+    expect(s.text()).not.toContain(b);
+    expect(s.ratings().map((button) => [textOf(button), button.disabled])).toEqual([
+      ["Again", false],
+      ["Hard", true],
+      ["Good", true],
+      ["Easy", true],
+    ]);
+    for (const label of ["Hard", "Good", "Easy"]) await click(buttonByText(s.root, label));
+    expect(reviewBodies()).toHaveLength(1);
+
+    // 再送は同じ attempt のまま。勝手に取り直して B に進めたりしない。
+    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
+    const bodies = reviewBodies();
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "POST /api/review"]);
+    expect(s.text()).toContain("card_not_found");
+    expect(s.text()).toContain(a);
+    expect(await countReviews()).toBe(0);
+    expect(await stateOf(bId)).toMatchObject({ version: 1 });
+  });
+
+  it("400(計測が壊れた本文)でも attempt を保持し、理由を出して再送に任せる", async () => {
+    connect();
+    const cardId = await importOne();
+
+    const s = await openReview();
+    // 端末の時計が飛んで、めくった時刻が丸 1 日以上前になった(elapsed_ms が上限を超える)。
+    vi.setSystemTime(new Date(NOW.getTime() - 25 * 60 * MINUTE));
+    await click(buttonByText(s.root, "めくる"));
+    vi.setSystemTime(NOW);
+    await click(buttonByText(s.root, "Good"));
+
+    expect(s.text()).toContain("invalid_elapsed_ms");
+    expect(s.has("同じ評価をもう一度送る")).toBe(true);
+    // 確定していないので、次のカードへ進めも取り直しもしない(評価が消えない)。
+    expect(s.text()).toContain("invoice");
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
+    expect(await countReviews()).toBe(0);
+    expect(await stateOf(cardId)).toMatchObject({ version: 1 });
+  });
+});
