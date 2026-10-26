@@ -7,6 +7,7 @@ lingo — 自分ひとり用の語彙 SRS(TOEIC 単語カードを FSRS で回�
 
 - `src/worker/` Worker(Hono)。`app.ts` が経路、`access.ts` が Cloudflare Access JWT 検証、`guard.ts` が POST の共通ガード
 - `src/client/` フロント(Preact、UI ライブラリなし、スマホ 1 カラム)。`index.html` がエントリ、`dist/` に出る
+- `src/shared/` Worker と画面の両方が使う純粋な契約(取り込みの上限・行の検証)。D1 も DOM も触らない
 - `migrations/` D1 の migration(`NNNN_<name>.sql`)
 - `test/` Vitest(`@cloudflare/vitest-plugin` で workerd 上、`wrangler.jsonc` を読み、ローカル D1 に migration 適用済み)
 - `worker-configuration.d.ts` は生成物(`pnpm cf-typegen`)。`wrangler.jsonc` を変えたら再生成して commit
