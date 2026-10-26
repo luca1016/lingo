@@ -88,6 +88,16 @@ describe("Access JWT", () => {
     expect((await api.json<{ error: string; message: string }>()).error).toBe("unauthenticated");
   });
 
+  it("PWA の殻(manifest・アイコン)も認証なしなら 403、正しい JWT なら静的アセットから返る", async () => {
+    for (const path of ["/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png"]) {
+      expect((await get(path)).status, path).toBe(403);
+
+      const ok = await get(path, { "Cf-Access-Jwt-Assertion": await token() });
+      expect(ok.status, path).toBe(200);
+      expect(ok.headers.get("x-from"), path).toBe("assets");
+    }
+  });
+
   it("API 経路は検証に通らないトークン(期限切れ・別メール・署名不正)も 401", async () => {
     for (const opts of [
       { exp: nowSec - 1 },
