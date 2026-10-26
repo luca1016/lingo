@@ -255,6 +255,67 @@ describe("復習の状態機械(送信中・未確定)", () => {
     expect(resolved.phase).toEqual({ kind: "showing", cardId: "B", revealedAt: null });
   });
 
+  it("不変条件 B: 期限を過ぎてから確定しても、短期カードは保留の統合で消えない", () => {
+    const session = sending([dueCard("A")]);
+    // 送っているあいだに取得が返る(サーバはまだ A を出していない = 1 分後の期限)。
+    const held = reduce(session, {
+      type: "load_succeeded",
+      generation: session.generation,
+      cards: [],
+      newRemaining: 19,
+      now: NOW,
+    });
+    expect(held.pending).toEqual({ cards: [], newRemaining: 19 });
+
+    // 再送が確定したのは 2 分後。確定した due(1 分後)はもう過ぎている。
+    const resolved = reduce(held, {
+      type: "send_resolved",
+      attempt: ATTEMPT,
+      state: appliedState(),
+      now: NOW + 2 * MINUTE,
+    });
+    expect(resolved.queue.map((q) => [q.cardId, q.version, q.due])).toEqual([
+      ["A", 2, appliedState().due],
+    ]);
+    expect(resolved.phase).toEqual({ kind: "showing", cardId: "A", revealedAt: null });
+  });
+
+  it("不変条件 B: 確定より前に始まった取得は、確定後に返っても反映しない", () => {
+    // 取得中に評価を送り、取得の応答より先に 200 が返る状況。
+    const revealed = reduce(loaded(), { type: "reveal", cardId: "A", now: NOW });
+    const fetching = reduce(revealed, { type: "load_started", force: false, notice: null });
+    const session = reduce(fetching, { type: "send_started", attempt: ATTEMPT });
+    expect(session.fetching).toBe(true);
+    const generation = session.generation;
+
+    const resolved = reduce(session, {
+      type: "send_resolved",
+      attempt: ATTEMPT,
+      state: appliedState(),
+      now: NOW,
+    });
+    // 進行中だった取得は無効にする(世代が進む)。取り直すのは呼び出し側。
+    expect(resolved.fetching).toBe(false);
+    expect(resolved.generation).toBe(generation + 1);
+    expect(resolved.queue.map((q) => [q.cardId, q.version])).toEqual([
+      ["B", 1],
+      ["A", 2],
+    ]);
+
+    // 評価前の内容(A は version 1・期限到来済み)が後から届いても、確定した版に巻き戻さない。
+    rejectsAll(resolved, [
+      {
+        type: "load_succeeded",
+        generation,
+        cards: [dueCard("A"), dueCard("B")],
+        newRemaining: 20,
+        now: NOW,
+      },
+      { type: "load_failed", generation, failure: "通信できなかった" },
+      { type: "auth_expired", generation },
+    ]);
+  });
+
   it("不変条件 C: 200 なら確定して次へ(短期カードは待ち時間つきで残る)", () => {
     const resolved = reduce(sending([dueCard("A")]), {
       type: "send_resolved",

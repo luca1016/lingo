@@ -23,7 +23,8 @@
 //     だけ。通信失敗は unresolved に移り、ユーザーの操作で再送する。
 //
 // 取得には世代番号(`generation`)を付ける。応答が返った時点で最新世代でなければ捨てる。
-// 世代は状態が持つので、タブを往復して画面が作り直されても続く。
+// 世代は状態が持つので、タブを往復して画面が作り直されても続く。確定より前に始まった取得も
+// 「古い応答」なので、確定の時点で世代を進めて無効にする(評価前の版に巻き戻さない)。
 
 import {
   type DueCard,
@@ -188,6 +189,18 @@ function settle(queue: readonly QueuedCard[], now: number): Phase {
   if (queue.length === 0) return { kind: "done" };
   const next = earliestDue(queue, now);
   return next ? { kind: "showing", cardId: next.cardId, revealedAt: null } : { kind: "idle" };
+}
+
+/**
+ * attempt が確定したときの、進行中の取得の扱い(不変条件 B)。
+ * 確定より前に始まった取得の応答は「評価前のサーバの状態」なので、反映すると確定した
+ * version / due が巻き戻る。世代を進めて無効にし、代わりに取り直す(呼び出し側が `loadDue`)。
+ */
+function invalidateFetch(session: Session): { fetching: boolean; generation: number } {
+  return {
+    fetching: false,
+    generation: session.fetching ? session.generation + 1 : session.generation,
+  };
 }
 
 /** attempt の結果を待っているか(= 他の操作をすべて拒否する。不変条件 A)。 */
@@ -355,22 +368,25 @@ function resolveSend(
   const shortTerm =
     queueOfFsrsState(action.state.fsrs_state) === "learning" &&
     Date.parse(action.state.due) - action.now <= SHORT_TERM_WAIT_MAX_MS;
-  const advanced =
-    reviewed && shortTerm
-      ? [...rest, { ...reviewed, version: action.state.version, due: action.state.due }]
-      : rest;
   // 保留していた応答は、この確定より前にサーバが見た内容。評価した 1 枚については
   // いま確定した version / due のほうが新しいので、サーバ側の古い 1 枚は入れない。
   const pending = session.pending;
-  const queue = pending
+  const merged = pending
     ? mergeQueue(
-        advanced,
+        rest,
         pending.cards.filter((c) => c.card_id !== cardId),
         action.now,
       )
-    : advanced;
+    : rest;
+  // 短期カードは確定した version / due で戻す。再送が期限を過ぎてから確定することもあるので、
+  // 期限では絞らない(ここで落とすと、サーバがまだ出していないそのカードは出番を失う)。
+  const queue =
+    reviewed && shortTerm
+      ? [...merged, { ...reviewed, version: action.state.version, due: action.state.due }]
+      : merged;
   return {
     ...session,
+    ...invalidateFetch(session),
     queue,
     pending: null,
     newRemaining: pending ? pending.newRemaining : session.newRemaining,
@@ -383,12 +399,13 @@ function resolveSend(
 /**
  * 409(別版)・404(消えた)で確定した。手元の version が古いと分かったので、
  * そのカードは落として取り直す(呼び出し側が `loadDue` する)。
- * 保留していた応答もこの確定より前の内容なので捨てる。
+ * 保留していた応答・進行中の取得もこの確定より前の内容なので使わない。
  */
 function conflictSend(session: Session, attempt: ReviewAttempt): Session {
   if (!isSending(session.phase, attempt)) return session;
   return {
     ...session,
+    ...invalidateFetch(session),
     queue: session.queue.filter((q) => q.cardId !== attempt.cardId),
     pending: null,
     phase: { kind: "idle" },
@@ -578,12 +595,16 @@ async function send(session: Session, attempt: ReviewAttempt, set: SetSession): 
   try {
     const res = await postReview(attempt);
     if (res.ok) {
-      dispatch(set, sending, {
+      const resolved = dispatch(set, sending, {
         type: "send_resolved",
         attempt,
         state: res.response.state,
         now: Date.now(),
       });
+      // 確定より前に始まっていた取得は無効にしたので、代わりにここで取り直す。
+      if (resolved.after !== resolved.before && resolved.before.fetching) {
+        await loadDue(resolved.after, set, { force: true });
+      }
       return;
     }
     if (res.error.error === "unauthenticated") {
