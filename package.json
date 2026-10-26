@@ -16,7 +16,8 @@
   "dependencies": {
     "hono": "^4.13.13",
     "jose": "^6.2.13",
-    "preact": "^11.0.1"
+    "preact": "^11.0.1",
+    "ts-fsrs": "^5.4.2"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.2",
