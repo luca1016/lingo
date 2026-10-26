@@ -26,9 +26,17 @@ import {
  */
 export const SHORT_TERM_WAIT_MAX_MS = 60 * 60 * 1000;
 
-/** 出題待ちの 1 枚。`due` を過ぎるまでは出さない(短期カードの待ち)。 */
+/**
+ * 出題待ちの 1 枚。`due` を過ぎるまでは出さない(短期カードの待ち)。
+ * `version` と `due` は評価するたびに進むので、表示する中身とは分けて持つ
+ * (DueCard をそのまま抱えると、中の version / due が古いまま残る)。
+ */
 export interface QueuedCard {
-  card: DueCard;
+  cardId: string;
+  front: string;
+  back: string;
+  example: string | null;
+  note: string | null;
   /** 次に送る expected_version。 */
   version: number;
   /** これ以降に出せる(UTC ISO)。 */
@@ -76,7 +84,15 @@ export function newSession(): Session {
 }
 
 function toQueued(card: DueCard): QueuedCard {
-  return { card, version: card.version, due: card.due };
+  return {
+    cardId: card.card_id,
+    front: card.front,
+    back: card.back,
+    example: card.example,
+    note: card.note,
+    version: card.version,
+    due: card.due,
+  };
 }
 
 /**
@@ -90,10 +106,8 @@ export function mergeQueue(
   now: Date,
 ): QueuedCard[] {
   const fromServer = cards.map(toQueued);
-  const ids = new Set(fromServer.map((q) => q.card.card_id));
-  const waiting = previous.filter(
-    (q) => !ids.has(q.card.card_id) && Date.parse(q.due) > now.getTime(),
-  );
+  const ids = new Set(fromServer.map((q) => q.cardId));
+  const waiting = previous.filter((q) => !ids.has(q.cardId) && Date.parse(q.due) > now.getTime());
   return [...fromServer, ...waiting];
 }
 
@@ -195,7 +209,7 @@ function attemptFor(session: Session, card: QueuedCard, rating: ReviewRating, no
   const previous = session.attempt;
   if (
     previous &&
-    previous.cardId === card.card.card_id &&
+    previous.cardId === card.cardId &&
     previous.rating === rating &&
     previous.expectedVersion === card.version
   ) {
@@ -203,7 +217,7 @@ function attemptFor(session: Session, card: QueuedCard, rating: ReviewRating, no
   }
   return {
     reviewId: newReviewId(),
-    cardId: card.card.card_id,
+    cardId: card.cardId,
     rating,
     expectedVersion: card.version,
     occurredAt: now.toISOString(),
@@ -223,9 +237,7 @@ export async function rate(
   now: Date = new Date(),
 ): Promise<void> {
   if (session.sending || session.loading || session.authExpired || !session.revealed) return;
-  const inQueue = session.queue.some(
-    (q) => q.card.card_id === card.card.card_id && q.version === card.version,
-  );
+  const inQueue = session.queue.some((q) => q.cardId === card.cardId && q.version === card.version);
   if (!inQueue) return;
   await send(session, attemptFor(session, card, rating, now), set, now);
 }
@@ -284,8 +296,8 @@ function advance(
   state: { due: string; version: number; fsrs_state: number },
   now: Date,
 ): Session {
-  const reviewed = session.queue.find((q) => q.card.card_id === cardId);
-  const rest = session.queue.filter((q) => q.card.card_id !== cardId);
+  const reviewed = session.queue.find((q) => q.cardId === cardId);
+  const rest = session.queue.filter((q) => q.cardId !== cardId);
   const shortTerm =
     queueOfFsrsState(state.fsrs_state) === "learning" &&
     Date.parse(state.due) - now.getTime() <= SHORT_TERM_WAIT_MAX_MS;
@@ -293,7 +305,7 @@ function advance(
     ...session,
     queue:
       reviewed && shortTerm
-        ? [...rest, { card: reviewed.card, version: state.version, due: state.due }]
+        ? [...rest, { ...reviewed, version: state.version, due: state.due }]
         : rest,
     revealed: false,
     revealedAt: null,

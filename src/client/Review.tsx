@@ -75,12 +75,12 @@ export function Review({ session, setSession }: { session: Session; setSession: 
 
       {card ? (
         <article>
-          <p style={front}>{card.card.front}</p>
+          <p style={front}>{card.front}</p>
           {session.revealed ? (
             <>
-              <p style={back}>{card.card.back}</p>
-              {card.card.example ? <p style={sub}>{card.card.example}</p> : null}
-              {card.card.note ? <p style={sub}>{card.card.note}</p> : null}
+              <p style={back}>{card.back}</p>
+              {card.example ? <p style={sub}>{card.example}</p> : null}
+              {card.note ? <p style={sub}>{card.note}</p> : null}
               <div style={{ display: "flex", gap: "8px" }}>
                 {RATINGS.map((rating) => (
                   <button
