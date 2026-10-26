@@ -36,10 +36,22 @@ describe("0001_init.sql", () => {
     for (const table of TABLES) expect(names, table).toContain(table);
   });
 
-  it("カードは UUID の id と論理削除の deleted_at を持つ", async () => {
+  it("カードは UUID の id・front / back・論理削除の deleted_at を持つ", async () => {
     expect(await columnNames("cards")).toEqual(
-      expect.arrayContaining(["id", "deck_id", "deleted_at", "created_at", "updated_at"]),
+      expect.arrayContaining([
+        "id",
+        "deck_id",
+        "front",
+        "back",
+        "deleted_at",
+        "created_at",
+        "updated_at",
+      ]),
     );
+  });
+
+  it("card_state の State 列は fsrs_state", async () => {
+    expect(await columnNames("card_state")).toContain("fsrs_state");
   });
 
   it("card_state は楽観ロックの version を持つ", async () => {
@@ -70,6 +82,18 @@ describe("0001_init.sql", () => {
         "correction_of",
       ]),
     );
+  });
+
+  it("reviews の elapsed_ms は INTEGER で NULL 可", async () => {
+    const { results } = await env.DB.prepare("PRAGMA table_info(reviews)").all<{
+      name: string;
+      type: string;
+      notnull: number;
+    }>();
+    const elapsed = results.find((c) => c.name === "elapsed_ms");
+    expect(elapsed).toBeDefined();
+    expect(elapsed?.type).toBe("INTEGER");
+    expect(elapsed?.notnull).toBe(0);
   });
 
   it("固定デッキが 1 件だけ入っている", async () => {
@@ -131,13 +155,24 @@ describe("migration の運用", () => {
     expect(await count("settings")).toBe(1);
   });
 
-  it("migration の SQL を直接 2 回流しても失敗しない", async () => {
+  it("適用済みの DB に、別の接続から 0001 の SQL を素のまま流しても壊れない", async () => {
+    // applyD1Migrations は d1_migrations を見るので 2 回目は何もしない。
+    // 追跡表を介さない経路(= 別セッションでの素の実行)でも落ちず、行も設定値も変わらないこと。
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
+    const before = await env.DB.prepare("SELECT * FROM settings WHERE id = 1").first();
+
+    const session = env.DB.withSession("first-primary");
     for (const migration of env.TEST_MIGRATIONS) {
       for (const query of migration.queries) {
-        await env.DB.prepare(query).run();
+        await session.prepare(query).run();
       }
     }
+
+    expect(await tableNames()).toEqual(expect.arrayContaining(TABLES));
+    expect(await columnNames("cards")).toEqual(expect.arrayContaining(["front", "back"]));
+    expect(await columnNames("reviews")).toContain("elapsed_ms");
     expect(await count("decks")).toBe(1);
     expect(await count("settings")).toBe(1);
+    expect(await env.DB.prepare("SELECT * FROM settings WHERE id = 1").first()).toEqual(before);
   });
 });
