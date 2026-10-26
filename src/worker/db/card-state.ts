@@ -12,6 +12,44 @@ export async function getCardState(db: D1Database, cardId: string): Promise<Card
 }
 
 /**
+ * 「読んだときの version がまだ生きている」ことを条件にした card_state の UPDATE 文。
+ * 1 文だけで使うなら saveCardState、他の文と同じ batch に混ぜるならこれを使う。
+ */
+export function updateCardStateStatement(
+  db: D1Database,
+  next: CardStateRow,
+  expectedVersion: number,
+): D1PreparedStatement {
+  if (next.version !== expectedVersion + 1) {
+    throw new Error(`version mismatch: expected ${expectedVersion + 1}, got ${next.version}`);
+  }
+  return db
+    .prepare(
+      `UPDATE card_state
+       SET due = ?, stability = ?, difficulty = ?, elapsed_days = ?, scheduled_days = ?,
+           learning_steps = ?, reps = ?, lapses = ?, fsrs_state = ?, last_review = ?,
+           version = ?, updated_at = ?
+       WHERE card_id = ? AND version = ?`,
+    )
+    .bind(
+      next.due,
+      next.stability,
+      next.difficulty,
+      next.elapsed_days,
+      next.scheduled_days,
+      next.learning_steps,
+      next.reps,
+      next.lapses,
+      next.fsrs_state,
+      next.last_review,
+      next.version,
+      next.updated_at,
+      next.card_id,
+      expectedVersion,
+    );
+}
+
+/**
  * FSRS 状態を楽観ロックで書く。
  * `expectedVersion` は読み出したときの version(行が無ければ 0)。`next.version` はその +1 でなければならない。
  * 他の更新が先に入っていた(= version が合わない)ときは何も書かずに false を返す。
@@ -52,30 +90,6 @@ export async function saveCardState(
     return inserted.meta.changes > 0;
   }
 
-  const updated = await db
-    .prepare(
-      `UPDATE card_state
-       SET due = ?, stability = ?, difficulty = ?, elapsed_days = ?, scheduled_days = ?,
-           learning_steps = ?, reps = ?, lapses = ?, fsrs_state = ?, last_review = ?,
-           version = ?, updated_at = ?
-       WHERE card_id = ? AND version = ?`,
-    )
-    .bind(
-      next.due,
-      next.stability,
-      next.difficulty,
-      next.elapsed_days,
-      next.scheduled_days,
-      next.learning_steps,
-      next.reps,
-      next.lapses,
-      next.fsrs_state,
-      next.last_review,
-      next.version,
-      next.updated_at,
-      next.card_id,
-      expectedVersion,
-    )
-    .run();
+  const updated = await updateCardStateStatement(db, next, expectedVersion).run();
   return updated.meta.changes > 0;
 }

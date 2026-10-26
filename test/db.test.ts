@@ -12,6 +12,9 @@ import {
 } from "ts-fsrs";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  type CardStateRow,
+  commitReview,
+  countNewStartedBetween,
   DEFAULT_DECK_ID,
   findCardIdsByFront,
   getCard,
@@ -23,12 +26,13 @@ import {
   getSettings,
   insertImport,
   insertReview,
+  listDueCards,
   type NewImportedCard,
   type NewReview,
   saveCardState,
 } from "../src/worker/db";
-import { toCardStateRow } from "../src/worker/fsrs";
-import { toUtcIso } from "../src/worker/time";
+import { applyReview, toCardStateRow } from "../src/worker/fsrs";
+import { dayWindow, toUtcIso } from "../src/worker/time";
 
 const NOW = new Date("2026-10-24T15:00:00.000Z"); // JST では 2026-10-25 00:00
 const CARD_ID = "11111111-2222-4333-8444-555555555555";
@@ -202,6 +206,213 @@ describe("reviews(冪等キー)", () => {
     expect((await getReview(env.DB, correctionId))?.correction_of).toBe(REVIEW_ID);
     const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM reviews").first<{ n: number }>();
     expect(row?.n).toBe(2);
+  });
+});
+
+describe("commitReview(1 batch で条件付き UPDATE + INSERT)", () => {
+  const REVIEW_ID = "77777777-6666-4555-8444-333333333333";
+
+  /** 新規の card_state を持つカードを 1 枚用意する(version 1)。 */
+  async function seedNew(): Promise<CardStateRow> {
+    await seedCard();
+    const state = toCardStateRow(CARD_ID, createEmptyCard(NOW), 1, NOW);
+    await saveCardState(env.DB, state, 0);
+    return state;
+  }
+
+  function commitArgs(state: CardStateRow, reviewId = REVIEW_ID) {
+    const applied = applyReview({
+      state,
+      rating: 3,
+      occurredAt: NOW,
+      receivedAt: NOW,
+      parameters: generatorParameters(),
+    });
+    return {
+      review: {
+        review_id: reviewId,
+        card_id: CARD_ID,
+        rating: 3,
+        occurred_at: NOW,
+        received_at: NOW,
+        elapsed_ms: 1200,
+        state_before: applied.state_before,
+        state_after: applied.state_after,
+        review_log: applied.review_log,
+        fsrs_version: applied.fsrs_version,
+        params_version: 1,
+      },
+      next: applied.state_after,
+      expectedVersion: state.version,
+    };
+  }
+
+  it("version が合えば state が進み、reviews が 1 行入る", async () => {
+    const state = await seedNew();
+    const args = commitArgs(state);
+    expect(await commitReview(env.DB, args)).toBe(true);
+
+    expect(await getCardState(env.DB, CARD_ID)).toEqual(args.next);
+    const row = await getReview(env.DB, REVIEW_ID);
+    expect(row?.card_id).toBe(CARD_ID);
+    expect(JSON.parse(row?.state_before ?? "null")).toEqual(state);
+    expect(JSON.parse(row?.state_after ?? "null")).toEqual(args.next);
+    expect(row?.fsrs_version).toBe(FSRSVersion);
+  });
+
+  it("先に別の評価が入っていたら 1 行も書かない(reviews も増えない)", async () => {
+    const state = await seedNew();
+    expect(await commitReview(env.DB, commitArgs(state))).toBe(true);
+    const after = await getCardState(env.DB, CARD_ID);
+
+    // 同じ version(= 古い)のまま別の review_id で来たもの。
+    const stale = commitArgs(state, "66666666-5555-4444-8333-222222222222");
+    expect(await commitReview(env.DB, stale)).toBe(false);
+
+    expect(await getCardState(env.DB, CARD_ID)).toEqual(after);
+    expect(await getReview(env.DB, "66666666-5555-4444-8333-222222222222")).toBeNull();
+    const counted = await env.DB.prepare("SELECT COUNT(*) AS n FROM reviews").first<{
+      n: number;
+    }>();
+    expect(counted?.n).toBe(1);
+  });
+
+  it("同じ review_id の二重確定は state を 2 回進めない", async () => {
+    const state = await seedNew();
+    expect(await commitReview(env.DB, commitArgs(state))).toBe(true);
+    // 1 回目と同じ引数(= 再送)。version はもう合わないので false。
+    expect(await commitReview(env.DB, commitArgs(state))).toBe(false);
+    expect((await getCardState(env.DB, CARD_ID))?.version).toBe(2);
+    const counted = await env.DB.prepare("SELECT COUNT(*) AS n FROM reviews").first<{
+      n: number;
+    }>();
+    expect(counted?.n).toBe(1);
+  });
+});
+
+describe("出題候補の問い合わせ", () => {
+  /** カード 1 枚と、指定した FSRS 状態の card_state を入れる。 */
+  async function seedStated(params: {
+    id: string;
+    front: string;
+    fsrsState: number;
+    due: Date;
+    createdAt?: Date;
+  }) {
+    const at = toUtcIso(params.createdAt ?? NOW);
+    await env.DB.prepare(
+      `INSERT INTO cards (id, deck_id, front, back, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(params.id, DEFAULT_DECK_ID, params.front, `${params.front} の意味`, at, at)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO card_state (card_id, due, stability, difficulty, elapsed_days, scheduled_days,
+         learning_steps, reps, lapses, fsrs_state, last_review, version, updated_at)
+       VALUES (?, ?, 1.0, 5.0, 0, 0, 0, 1, 0, ?, NULL, 3, ?)`,
+    )
+      .bind(params.id, toUtcIso(params.due), params.fsrsState, at)
+      .run();
+  }
+
+  const id = (n: number) => `aaaaaaaa-0000-4000-8000-00000000000${n}`;
+
+  it("待ち行列ごとに期限到来だけを due の古い順で返す", async () => {
+    await seedStated({
+      id: id(1),
+      front: "learn-late",
+      fsrsState: 1,
+      due: new Date(NOW.getTime() - 60_000),
+    });
+    await seedStated({
+      id: id(2),
+      front: "learn-early",
+      fsrsState: 3,
+      due: new Date(NOW.getTime() - 120_000),
+    });
+    await seedStated({
+      id: id(3),
+      front: "learn-future",
+      fsrsState: 1,
+      due: new Date(NOW.getTime() + 1),
+    });
+    await seedStated({ id: id(4), front: "review-due", fsrsState: 2, due: NOW });
+    await seedStated({
+      id: id(5),
+      front: "review-future",
+      fsrsState: 2,
+      due: new Date(NOW.getTime() + 60_000),
+    });
+    await seedStated({
+      id: id(6),
+      front: "new",
+      fsrsState: 0,
+      due: new Date(NOW.getTime() + 60_000),
+    });
+
+    const learning = await listDueCards(env.DB, { queue: "learning", now: NOW, limit: 10 });
+    expect(learning.map((r) => r.front)).toEqual(["learn-early", "learn-late"]);
+    expect(learning[0]?.version).toBe(3);
+
+    const review = await listDueCards(env.DB, { queue: "review", now: NOW, limit: 10 });
+    expect(review.map((r) => r.front)).toEqual(["review-due"]);
+
+    // 新規は期限を見ない(上限で絞るのは呼び出し側)。
+    const fresh = await listDueCards(env.DB, { queue: "new", now: NOW, limit: 10 });
+    expect(fresh.map((r) => r.front)).toEqual(["new"]);
+
+    expect(await listDueCards(env.DB, { queue: "new", now: NOW, limit: 0 })).toEqual([]);
+  });
+
+  it("論理削除したカードは出てこない", async () => {
+    await seedStated({ id: id(1), front: "gone", fsrsState: 2, due: NOW });
+    await env.DB.prepare("UPDATE cards SET deleted_at = ? WHERE id = ?")
+      .bind(toUtcIso(NOW), id(1))
+      .run();
+    expect(await listDueCards(env.DB, { queue: "review", now: NOW, limit: 10 })).toEqual([]);
+  });
+
+  it("新規は作った順に出る", async () => {
+    await seedStated({
+      id: id(1),
+      front: "later",
+      fsrsState: 0,
+      due: NOW,
+      createdAt: new Date(NOW.getTime() + 1000),
+    });
+    await seedStated({ id: id(2), front: "sooner", fsrsState: 0, due: NOW, createdAt: NOW });
+    const fresh = await listDueCards(env.DB, { queue: "new", now: NOW, limit: 10 });
+    expect(fresh.map((r) => r.front)).toEqual(["sooner", "later"]);
+  });
+
+  it("初回評価の枚数は範囲内のユニーク枚数(同じカードの 2 回目は数えない)", async () => {
+    await seedCard();
+    const { start, end } = dayWindow(NOW, "Asia/Tokyo");
+    const insert = async (reviewId: string, cardId: string, occurredAt: Date) => {
+      await env.DB.prepare(
+        `INSERT INTO reviews (review_id, card_id, rating, occurred_at, received_at, state_before,
+           state_after, review_log, fsrs_version, params_version)
+         VALUES (?, ?, 3, ?, ?, '{}', '{}', '{}', ?, 1)`,
+      )
+        .bind(reviewId, cardId, toUtcIso(occurredAt), toUtcIso(occurredAt), FSRSVersion)
+        .run();
+    };
+
+    expect(await countNewStartedBetween(env.DB, start, end)).toBe(0);
+
+    await insert("r1", CARD_ID, NOW);
+    await insert("r2", CARD_ID, new Date(NOW.getTime() + 60_000));
+    expect(await countNewStartedBetween(env.DB, start, end)).toBe(1);
+
+    // 前の日に初回評価したカードは、今日の枠を使わない。
+    await seedCard(id(9));
+    await insert("r3", id(9), new Date(start.getTime() - 1));
+    await insert("r4", id(9), NOW);
+    expect(await countNewStartedBetween(env.DB, start, end)).toBe(1);
+
+    // 範囲は start 以上 end 未満。
+    expect(await countNewStartedBetween(env.DB, new Date(start.getTime() - 1), start)).toBe(1);
+    expect(await countNewStartedBetween(env.DB, end, new Date(end.getTime() + 1))).toBe(0);
   });
 });
 
