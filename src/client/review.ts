@@ -8,6 +8,9 @@
 //  - 409(version_conflict)は端末の持っている version が古いだけなので、due を取り直して続ける。
 //  - 認証切れ(401)はログインし直すまで何を送っても通らないので、再送をやめて案内だけ出す。
 //  - 短期カード(学習ステップ)は due を手元に持ち、時間が来たら同じ画面で出し直す。
+//  - 取得(GET /api/due)には世代番号を付け、応答が返った時点で最新世代でなければ結果を捨てる。
+//    画面の状態は「いまの状態(prev)」から作り直す(更新関数で渡す)ので、遅れて返ってきた取得が
+//    送信状態・再送キー・短期カードを巻き戻すことがない。
 
 import { type DueCard, queueOfFsrsState, type ReviewRating } from "../shared/review";
 import {
@@ -64,9 +67,15 @@ export interface Session {
   notice: string | null;
   /** その日あと何枚の新規を出せるか(未取得なら null)。 */
   newRemaining: number | null;
+  /**
+   * いまの状態を作った取得の世代(`loadDue` のたびに 1 つ進む。0 = まだ取得していない)。
+   * 応答が返った時点でこれが自分の世代でなければ、新しい取得が始まっているので結果は捨てる。
+   */
+  generation: number;
 }
 
-export type SetSession = (next: Session) => void;
+/** 画面の状態を更新する(いまの状態から次を作る。古い値を抱えたまま上書きしないため)。 */
+export type SetSession = (update: (prev: Session) => Session) => void;
 
 export function newSession(): Session {
   return {
@@ -80,7 +89,19 @@ export function newSession(): Session {
     loading: false,
     notice: null,
     newRemaining: null,
+    generation: 0,
   };
+}
+
+/**
+ * 取得に付ける世代番号を作る(単調増加。同じ番号は二度出ない)。
+ * 画面を作り直しても(タブの往復で Review が再マウントされても)番号は続くので、
+ * 前の画面が出した取得の応答が後から返っても「古い」と分かる。
+ */
+let lastGeneration = 0;
+function nextGeneration(): number {
+  lastGeneration += 1;
+  return lastGeneration;
 }
 
 function toQueued(card: DueCard): QueuedCard {
@@ -179,37 +200,46 @@ function expired(session: Session): Session {
  * 送信中は取り直さない(POST と GET を同時に走らせない)。送信の結果はその応答で決まるので、
  * 並行して始めた GET が後から返って送信後の状態を上書きし、通信中でないのにボタンが無効のまま
  * 残る、ということが起きないようにする(タブを往復すると再マウントでここに来る)。
+ *
+ * 取得中に重ねて呼ばれても GET は出さない(進行中の 1 件に任せる)。画面を開き直したときだけは
+ * `force` で取り直す(離れている間にサーバ側が変わっている)。そのとき進行中だった古い取得は
+ * 世代が合わなくなるので、応答が返っても捨てられる。
  */
 export async function loadDue(
   session: Session,
   set: SetSession,
-  options: { notice?: string | null; now?: Date } = {},
+  options: { notice?: string | null; now?: Date; force?: boolean } = {},
 ): Promise<void> {
   if (session.authExpired || session.sending) return;
+  if (session.loading && !options.force) return;
   const now = options.now ?? new Date();
-  // 結果が未確定の 1 件(attempt)とその説明は捨てない。同じ review_id で再送して確定できるように。
-  const pending = session.attempt;
-  const loading: Session = {
-    ...session,
+  const generation = nextGeneration();
+  set((prev) => ({
+    ...prev,
     loading: true,
-    failure: pending ? session.failure : null,
+    generation,
+    // 結果が未確定の 1 件(attempt)とその説明は捨てない。同じ review_id で再送して確定できるように。
+    failure: prev.attempt ? prev.failure : null,
     notice: options.notice ?? null,
-  };
-  set(loading);
+  }));
 
   const res = await getDue();
+  // 自分より後に始まった取得があれば、この応答は古い。画面には何も書かない。
+  const ifLatest = (apply: (prev: Session) => Session): void => {
+    set((prev) => (prev.generation === generation ? apply(prev) : prev));
+  };
   if (!res.ok) {
-    if (res.error.error === "unauthenticated") return set(expired(loading));
-    return set({ ...loading, loading: false, failure: describe(res.error) });
+    if (res.error.error === "unauthenticated") return ifLatest(expired);
+    return ifLatest((prev) => ({ ...prev, loading: false, failure: describe(res.error) }));
   }
-  set({
-    ...loading,
+  ifLatest((prev) => ({
+    ...prev,
     loading: false,
-    queue: mergeQueue(loading.queue, res.response.cards, now, pending?.cardId ?? null),
+    queue: mergeQueue(prev.queue, res.response.cards, now, prev.attempt?.cardId ?? null),
     revealed: false,
     revealedAt: null,
     newRemaining: res.response.new_remaining,
-  });
+  }));
 }
 
 function describe(error: ReviewApiError): string {
@@ -267,38 +297,33 @@ async function send(
   set: SetSession,
   now: Date,
 ): Promise<void> {
-  const sending: Session = {
-    ...session,
-    sending: true,
-    attempt,
-    failure: null,
-    notice: null,
-  };
-  set(sending);
+  set((prev) => ({ ...prev, sending: true, attempt, failure: null, notice: null }));
 
   try {
     const res = await postReview(attempt);
     if (res.ok) {
-      set(advance(sending, attempt.cardId, res.response.state, now));
+      set((prev) => advance(prev, attempt.cardId, res.response.state, now));
       return;
     }
-    if (res.error.error === "unauthenticated") return set(expired(sending));
+    if (res.error.error === "unauthenticated") return set(expired);
     if (resendable(res.error)) {
-      set({ ...sending, sending: false, failure: describe(res.error) });
+      set((prev) => ({ ...prev, sending: false, failure: describe(res.error) }));
       return;
     }
     // 409(別の評価で先に進んでいた)や 404(消えた)は手元が古いだけ。出し直して続ける。
-    await loadDue({ ...sending, sending: false, attempt: null }, set, {
+    // 送った 1 件はもう再送しない(サーバの状態が違う)ので、ここで捨ててから取り直す。
+    set((prev) => ({ ...prev, sending: false, attempt: null }));
+    await loadDue({ ...session, sending: false, loading: false, attempt: null }, set, {
       notice: `出し直した(${describe(res.error)})`,
       now,
     });
   } catch (cause) {
     // postReview は例外を出さない作りだが、万一出ても送信中のまま固まらせない。
-    set({
-      ...sending,
+    set((prev) => ({
+      ...prev,
       sending: false,
       failure: `送信できなかった(${String(cause)})。${RESEND_HINT}`,
-    });
+    }));
   }
 }
 

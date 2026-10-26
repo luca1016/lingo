@@ -44,8 +44,11 @@ export function Review({ session, setSession }: { session: Session; setSession: 
   // 画面を開いたら出題を取り直す(タブを往復しても、待っている短期カードは手元に残る)。
   // 送信中なら取り直さない(その応答で決まる)。結果が分からないまま離れていた場合も、送った
   // 1 件は残してあるので、ここで取り直したあと同じ review_id で結果を確定できる(loadDue)。
+  //
+  // 離れている間にサーバ側が変わっているので、前の画面の取得が進行中でも取り直す(force)。
+  // 古いほうの応答は世代が合わなくなるので、後から返ってきても画面には入らない。
   useEffect(() => {
-    void loadDue(session, setSession);
+    void loadDue(session, setSession, { force: true });
   }, []);
 
   if (session.authExpired) {
@@ -101,7 +104,7 @@ export function Review({ session, setSession }: { session: Session; setSession: 
               type="button"
               style={button}
               disabled={session.sending}
-              onClick={() => setSession(reveal(session))}
+              onClick={() => setSession((prev) => reveal(prev))}
             >
               めくる
             </button>
