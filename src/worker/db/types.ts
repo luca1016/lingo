@@ -41,6 +41,24 @@ export interface CardStateRow {
   updated_at: string;
 }
 
+/** imports の 1 行。import_id が取り込みの冪等キー、result は 1 回目に返した応答本文(JSON 文字列)。 */
+export interface ImportRow {
+  import_id: string;
+  received_at: string;
+  added: number;
+  result: string;
+}
+
+/** imports で追加するカード 1 枚(id は呼び出し側が採番し、state は「新規」の FSRS 状態)。 */
+export interface NewImportedCard {
+  id: string;
+  front: string;
+  back: string;
+  example: string | null;
+  note: string | null;
+  state: CardStateRow;
+}
+
 /** reviews の 1 行(JSON 列は文字列のまま)。 */
 export interface ReviewRow {
   review_id: string;

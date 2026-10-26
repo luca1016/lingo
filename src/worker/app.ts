@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import pkg from "../../package.json";
 import { type AccessVariables, accessAuth, type JwksResolver, remoteJwks } from "./access";
+import { postCards } from "./cards";
 import { jsonSameOrigin } from "./guard";
 
 export interface AppOptions {
@@ -20,7 +21,10 @@ export function createApp(options: AppOptions = {}) {
   app.use("*", accessAuth(options.jwks ?? remoteJwks));
   app.use("/api/*", jsonSameOrigin());
 
-  // API の経路は Issue 1 以降でここに足す。
+  // カードの取り込み(Issue 2)。
+  app.post("/api/cards", postCards);
+
+  // 残りの API の経路は以降の Issue でここに足す。
   app.all("/api/*", (c) => c.json({ error: "not_found" }, 404));
 
   // 認証を通ったものだけ静的アセットへ委譲する(run_worker_first: true 前提)。

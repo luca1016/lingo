@@ -133,9 +133,36 @@ describe("0001_init.sql", () => {
   });
 });
 
+describe("0002_imports.sql", () => {
+  it("imports は import_id が主キーで、応答本文を持つ", async () => {
+    const { results } = await env.DB.prepare("PRAGMA table_info(imports)").all<{
+      name: string;
+      pk: number;
+      notnull: number;
+    }>();
+    expect(results.filter((c) => c.pk > 0).map((c) => c.name)).toEqual(["import_id"]);
+    expect(results.map((c) => c.name)).toEqual(
+      expect.arrayContaining(["received_at", "added", "result"]),
+    );
+    for (const column of results) expect(column.notnull, column.name).toBe(1);
+  });
+
+  it("同じ import_id は 2 回入らない", async () => {
+    await env.DB.prepare(
+      "INSERT INTO imports (import_id, received_at, added, result) VALUES ('i1', '2026-10-26T00:00:00.000Z', 0, '{}')",
+    ).run();
+    await expect(
+      env.DB.prepare(
+        "INSERT INTO imports (import_id, received_at, added, result) VALUES ('i1', '2026-10-26T00:00:00.000Z', 0, '{}')",
+      ).run(),
+    ).rejects.toThrow();
+    await env.DB.prepare("DELETE FROM imports WHERE import_id = 'i1'").run();
+  });
+});
+
 describe("migration の運用", () => {
   it("0001 から順に並んでいる", () => {
-    expect(env.TEST_MIGRATIONS[0]?.name).toBe("0001_init.sql");
+    expect(env.TEST_MIGRATIONS.map((m) => m.name)).toEqual(["0001_init.sql", "0002_imports.sql"]);
   });
 
   it("追加のみ(DROP・列削除が無い)", () => {

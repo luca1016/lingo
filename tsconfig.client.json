@@ -13,5 +13,6 @@
     "skipLibCheck": true,
     "types": []
   },
-  "include": ["src/client"]
+  // 画面のテスト(実画面を描画する)も JSX + DOM の設定で見る。
+  "include": ["src/client", "test/app.test.ts", "test/dom.ts"]
 }

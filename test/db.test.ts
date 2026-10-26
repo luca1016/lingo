@@ -13,13 +13,17 @@ import {
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_DECK_ID,
+  findCardIdsByFront,
   getCard,
   getCardIncludingDeleted,
   getCardState,
   getDeck,
+  getImport,
   getReview,
   getSettings,
+  insertImport,
   insertReview,
+  type NewImportedCard,
   type NewReview,
   saveCardState,
 } from "../src/worker/db";
@@ -44,6 +48,7 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM reviews"),
     env.DB.prepare("DELETE FROM card_state"),
     env.DB.prepare("DELETE FROM cards"),
+    env.DB.prepare("DELETE FROM imports"),
   ]);
 });
 
@@ -197,6 +202,100 @@ describe("reviews(冪等キー)", () => {
     expect((await getReview(env.DB, correctionId))?.correction_of).toBe(REVIEW_ID);
     const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM reviews").first<{ n: number }>();
     expect(row?.n).toBe(2);
+  });
+});
+
+describe("imports(冪等キーと一括投入)", () => {
+  const IMPORT_ID = "aaaa1111-2222-4333-8444-555555555555";
+
+  function newCard(id: string, front: string): NewImportedCard {
+    return {
+      id,
+      front,
+      back: `${front} の意味`,
+      example: null,
+      note: null,
+      state: toCardStateRow(id, createEmptyCard(NOW), 1, NOW),
+    };
+  }
+
+  it("cards・card_state・imports を 1 回で書き、再送は result から返せる", async () => {
+    const cards = [newCard(CARD_ID, "invoice")];
+    await insertImport(env.DB, {
+      importId: IMPORT_ID,
+      receivedAt: NOW,
+      result: { import_id: IMPORT_ID, added: 1 },
+      cards,
+    });
+
+    expect((await getCard(env.DB, CARD_ID))?.front).toBe("invoice");
+    expect(await getCardState(env.DB, CARD_ID)).toEqual(cards[0]?.state);
+
+    const row = await getImport(env.DB, IMPORT_ID);
+    expect(row?.received_at).toBe(toUtcIso(NOW));
+    expect(row?.added).toBe(1);
+    expect(JSON.parse(row?.result ?? "null")).toEqual({ import_id: IMPORT_ID, added: 1 });
+    expect(await getImport(env.DB, "no-such-import")).toBeNull();
+  });
+
+  it("途中で失敗したら 1 行も入らない(import_id の衝突)", async () => {
+    await insertImport(env.DB, {
+      importId: IMPORT_ID,
+      receivedAt: NOW,
+      result: { added: 0 },
+      cards: [],
+    });
+
+    await expect(
+      insertImport(env.DB, {
+        importId: IMPORT_ID,
+        receivedAt: NOW,
+        result: { added: 1 },
+        cards: [newCard(CARD_ID, "invoice")],
+      }),
+    ).rejects.toThrow();
+
+    expect(await getCard(env.DB, CARD_ID)).toBeNull();
+    expect(await getCardState(env.DB, CARD_ID)).toBeNull();
+    expect(JSON.parse((await getImport(env.DB, IMPORT_ID))?.result ?? "null")).toEqual({
+      added: 0,
+    });
+  });
+
+  it("D1 の bind 上限を超える件数でも分割して入れられる", async () => {
+    const cards = Array.from({ length: 120 }, (_, i) =>
+      newCard(`cccccccc-dddd-4eee-8fff-${String(i).padStart(12, "0")}`, `w${i}`),
+    );
+    await insertImport(env.DB, {
+      importId: IMPORT_ID,
+      receivedAt: NOW,
+      result: { added: cards.length },
+      cards,
+    });
+
+    const counted = await env.DB.prepare(
+      "SELECT (SELECT COUNT(*) FROM cards) AS cards, (SELECT COUNT(*) FROM card_state) AS states",
+    ).first<{ cards: number; states: number }>();
+    expect(counted).toEqual({ cards: 120, states: 120 });
+  });
+
+  it("生きているカードだけ front で引ける", async () => {
+    await insertImport(env.DB, {
+      importId: IMPORT_ID,
+      receivedAt: NOW,
+      result: {},
+      cards: [newCard(CARD_ID, "invoice")],
+    });
+
+    expect(await findCardIdsByFront(env.DB, ["invoice", "ledger"])).toEqual(
+      new Map([["invoice", CARD_ID]]),
+    );
+    expect(await findCardIdsByFront(env.DB, [])).toEqual(new Map());
+
+    await env.DB.prepare("UPDATE cards SET deleted_at = ? WHERE id = ?")
+      .bind(toUtcIso(NOW), CARD_ID)
+      .run();
+    expect(await findCardIdsByFront(env.DB, ["invoice"])).toEqual(new Map());
   });
 });
 
