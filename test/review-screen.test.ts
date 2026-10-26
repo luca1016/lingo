@@ -10,6 +10,7 @@
 //  - 409 は確定として扱い、最新を取り直して続ける
 //  - 応答がいつまでも返らない送信は期限で未確定になり、同じ本文で再送できる(送信中のまま固まらない)
 //  - 認証切れ(401)は再ログインを案内し、再送ループにしない
+//  - めくったまま 24 時間以上たっても、評価は確定する(上限を超える計測は送らない)
 //  - 取得中は GET を重ねて出さない / 表示中は GET を出さない(表示中のカードが入れ替わらない)
 //  - 短期カード(学習ステップ)は next_due_at で待ち時間を出し、時間が来たらサーバーから出し直す
 //  - アンマウント → 再マウントで状態(表示中・送信中・未確定)が残る
@@ -30,6 +31,7 @@ import { buttonByText, byTag, click, type FakeElement, flush, mount, textOf, unm
 //(flush() の setTimeout は本物のまま使いたい)。
 const NOW = new Date("2026-10-26T01:23:45.000Z");
 const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
 
 const RATING_LABELS = ["Again", "Hard", "Good", "Easy"];
 const ALL_DISABLED = [true, true, true, true];
@@ -504,6 +506,42 @@ describe("復習画面(基本)", () => {
     expect(s.text()).toContain("残り 1 枚");
     expect(s.text()).toContain("invoice");
     expect(s.text()).not.toContain("通信できなかった");
+  });
+
+  it("めくったまま 24 時間以上たっても、評価は 1 回で確定する(かかった時間は送らない)", async () => {
+    connect();
+    // めくったのは前日(タブを寝かせたまま翌日に戻ってきた)。評価するのは NOW。
+    vi.setSystemTime(new Date(NOW.getTime() - 25 * HOUR));
+    const cardId = await importOne();
+    const s = await openReview();
+    await click(buttonByText(s.root, "めくる"));
+
+    vi.setSystemTime(NOW);
+    await click(buttonByText(s.root, "Good"));
+
+    // 上限(MAX_ELAPSED_MS = 24 時間)を超える計測は送らない。送ると 400(invalid_elapsed_ms)で
+    // 未確定に固定され、同じ本文の再送も必ず 400 になる(再読み込みまで復習が続けられない)。
+    const bodies = reviewBodies();
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toMatchObject({
+      card_id: cardId,
+      rating: 3,
+      expected_version: 1,
+      occurred_at: toUtcIso(NOW),
+      elapsed_ms: null,
+    });
+
+    // 1 回で確定して次へ進む(未確定の案内は出ない)。
+    expect(s.text()).not.toContain("送信を確認できません");
+    expect(s.text()).toContain("つぎのカードまで");
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+    // ログにも「測れなかった」として入る(FSRS の計算には使っていない参考値)。
+    const logged = await env.DB.prepare("SELECT elapsed_ms FROM reviews WHERE card_id = ?")
+      .bind(cardId)
+      .first<{ elapsed_ms: number | null }>();
+    expect(logged?.elapsed_ms).toBeNull();
   });
 });
 

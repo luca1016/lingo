@@ -8,9 +8,21 @@
 // 表に無い組み合わせは「無視」= 同じ参照を返すので、`toBe` で押さえる。
 
 import { describe, expect, it } from "vitest";
-import { type Event, initialSession, reduce, type Session, unresolved } from "../src/client/review";
+import {
+  type Event,
+  initialSession,
+  measureElapsedMs,
+  reduce,
+  type Session,
+  unresolved,
+} from "../src/client/review";
 import type { ReviewAttempt } from "../src/client/review-api";
-import type { DueCard, DueResponse, ReviewRating } from "../src/shared/review";
+import {
+  type DueCard,
+  type DueResponse,
+  MAX_ELAPSED_MS,
+  type ReviewRating,
+} from "../src/shared/review";
 
 const NOW = Date.parse("2026-10-26T01:23:45.000Z");
 const MINUTE = 60 * 1000;
@@ -287,5 +299,21 @@ describe("復習の状態機械(めくる・評価)", () => {
     const resent = reduce(expired, { type: "RESEND" });
     expect(resent.attempt).toEqual({ ...ATTEMPT, phase: "sending", reason: undefined });
     expect(reduce(resent, { type: "POST_200", reviewId: ATTEMPT.review_id }).attempt).toBeNull();
+  });
+});
+
+describe("かかった時間の計測", () => {
+  it("契約の範囲(0〜MAX_ELAPSED_MS)に収まる値だけを送る", () => {
+    expect(measureElapsedMs(NOW + 1500, NOW)).toBe(1500);
+    expect(measureElapsedMs(NOW, NOW)).toBe(0);
+    expect(measureElapsedMs(NOW + MAX_ELAPSED_MS, NOW)).toBe(MAX_ELAPSED_MS);
+  });
+
+  it("上限超過と時計の巻き戻りは「測れなかった」(null)にする", () => {
+    // ここで上限超過の値を送ると 400(invalid_elapsed_ms)になり、確定でも無いので
+    // 同じ本文の再送が必ず 400 を繰り返す(= 再読み込みまで復習が続けられない)。
+    expect(measureElapsedMs(NOW + MAX_ELAPSED_MS + 1, NOW)).toBeNull();
+    expect(measureElapsedMs(NOW + 25 * 60 * 60 * 1000, NOW)).toBeNull();
+    expect(measureElapsedMs(NOW - 1, NOW)).toBeNull();
   });
 });

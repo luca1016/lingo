@@ -25,7 +25,12 @@
 //   attempt≠null               │ RATE / NEXT / タイマー / タブ復帰 │ 無視
 //   current≠null               │ タイマー(waitUntil)│ 無視(表示中のカードは切り替えない)
 
-import type { DueCard, DueResponse, ReviewRating } from "../shared/review";
+import {
+  type DueCard,
+  type DueResponse,
+  MAX_ELAPSED_MS,
+  type ReviewRating,
+} from "../shared/review";
 import {
   CONFLICT,
   getDue,
@@ -294,6 +299,20 @@ export function reveal(now: number = Date.now()): void {
   emit({ type: "REVEAL", now });
 }
 
+/**
+ * めくってから評価までの時間。測れなかったとき(= 契約の 0〜`MAX_ELAPSED_MS` に収まらないとき)は
+ * null を送る。めくったままタブを寝かせて翌日に評価すると 24 時間を超え、そのまま送ると
+ * `invalid_elapsed_ms` の 400 になる。400 は確定ではないので attempt は未確定のまま残り、
+ * 再送しても同じ本文(= 同じ不正値)なので必ず 400 — 再読み込みするまで復習が続けられなくなる。
+ * かかった時間は FSRS の計算に使っていない(ログの参考値)ので、怪しい値は送らない。
+ */
+export function measureElapsedMs(now: number, revealedAt: number): number | null {
+  const elapsed = now - revealedAt;
+  // 負(時計が巻き戻った)も上限超過も「測れなかった」として扱う。
+  if (elapsed < 0 || elapsed > MAX_ELAPSED_MS) return null;
+  return elapsed;
+}
+
 /** 表示中の 1 枚に評価をつけて送る(新しい `review_id` を作るのはここだけ)。 */
 export async function rate(rating: ReviewRating, now: Date = new Date()): Promise<void> {
   const current = session.current;
@@ -305,7 +324,7 @@ export async function rate(rating: ReviewRating, now: Date = new Date()): Promis
     rating,
     expected_version: current.version,
     occurred_at: now.toISOString(),
-    elapsed_ms: Math.max(0, now.getTime() - revealedAt),
+    elapsed_ms: measureElapsedMs(now.getTime(), revealedAt),
   };
   if (!emit({ type: "RATE", attempt })) return;
   await send(attempt.review_id);
