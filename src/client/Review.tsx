@@ -42,8 +42,7 @@ export function Review({ session, setSession }: { session: Session; setSession: 
   }, []);
 
   // 画面を開いたら出題を取り直す(タブを往復しても、待っている短期カードは手元に残る)。
-  // 送信の結果が分からないまま離れていた場合も、ここで取り直した状態が正になる
-  //(届いていれば次の期限に進んでいるし、届いていなければ同じカードがまた出る)。
+  // 送信中なら取り直さない(状態はその応答で決まる。古い取得で上書きしないため)。
   useEffect(() => {
     void loadDue(session, setSession);
   }, []);
@@ -128,7 +127,7 @@ export function Review({ session, setSession }: { session: Session; setSession: 
             <button
               type="button"
               style={button}
-              disabled={session.sending}
+              disabled={session.sending || session.loading}
               onClick={() => void resend(session, setSession)}
             >
               同じ評価をもう一度送る

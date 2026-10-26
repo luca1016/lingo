@@ -99,6 +99,7 @@ function toQueued(card: DueCard): QueuedCard {
  * 取り直した due と手元の待ち行列を合わせる。
  * サーバが出したものを正とし、手元にしかない「まだ期限が来ていない短期カード」だけ後ろに残す
  * (409 で出し直したときに、待っている短期カードの待ち時間表示を失わないため)。
+ *
  */
 export function mergeQueue(
   previous: readonly QueuedCard[],
@@ -168,13 +169,17 @@ function expired(session: Session): Session {
 /**
  * due を取り直す(初回・409・手動)。手元の待ち行列のうち、まだ期限が来ていない短期カードは残す。
  * 認証切れのあとは何もしない(再送ループを作らない)。
+ *
+ * 送信中は取り直さない(POST と GET を同時に走らせない)。送信の結果はその応答で決まるので、
+ * 並行して始めた GET が後から返って送信後の状態を上書きし、通信中でないのにボタンが無効のまま
+ * 残る、ということが起きないようにする(タブを往復すると再マウントでここに来る)。
  */
 export async function loadDue(
   session: Session,
   set: SetSession,
   options: { notice?: string | null; now?: Date } = {},
 ): Promise<void> {
-  if (session.authExpired) return;
+  if (session.authExpired || session.sending) return;
   const now = options.now ?? new Date();
   const loading: Session = {
     ...session,
@@ -244,7 +249,8 @@ export async function rate(
 
 /** 失敗した 1 件をそのまま(同じ review_id で)送り直す。 */
 export async function resend(session: Session, set: SetSession, now: Date = new Date()) {
-  if (session.sending || session.authExpired || !session.attempt) return;
+  // 取り直しの最中も送らない(GET と POST を同時に走らせない)。
+  if (session.sending || session.loading || session.authExpired || !session.attempt) return;
   await send(session, session.attempt, set, now);
 }
 

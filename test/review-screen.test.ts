@@ -275,6 +275,48 @@ describe("復習画面(実 API)", () => {
     expect(s.text()).toContain("つぎのカードまで");
   });
 
+  it("送信中にタブを往復しても、取り直しが送信の結果を上書きしない", async () => {
+    const held = gate();
+    const refetch = gate();
+    let gets = 0;
+    connect(async (call, send) => {
+      if (call.path === "/api/review") await held.wait;
+      // 送信中に始まった 2 回目以降の取得は、送信より後に返す(古い応答で上書きされないか見る)。
+      else if ((gets += 1) > 1) await refetch.wait;
+      return await send();
+    });
+    const ids = await importCards(["invoice", "ledger"]);
+    const order = (await serverDue()).cards.map((c) => c.front);
+    const first = ids.get(order[0] as string) as string;
+
+    const s = await openReview();
+    await answer(s, "Good");
+    expect(s.ratings().map((b) => b.disabled)).toEqual([true, true, true, true]);
+
+    // 別のタブへ行って戻る(復習画面は作り直される)。送信中なので取り直しはしない。
+    await click(buttonByText(s.root, "単票追加"));
+    await click(buttonByText(s.root, "復習"));
+    await flush();
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
+
+    // 送信 → 取得 の順に応答を返す(取得が後から返っても送信後の状態を壊さない)。
+    held.open();
+    await flush();
+    refetch.open();
+    await flush();
+
+    // 送信は終わっている。通信中でないのにボタンが無効のまま、にはならない。
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(first)).toMatchObject({ version: 2 });
+    expect(s.text()).toContain(order[1] as string);
+    await click(buttonByText(s.root, "めくる"));
+    expect(s.ratings().map((b) => b.disabled)).toEqual([false, false, false, false]);
+
+    // そのまま 2 枚目を評価できる。
+    await click(buttonByText(s.root, "Good"));
+    expect(await countReviews()).toBe(2);
+  });
+
   it("別の評価に変えて送るときは新しい review_id で送る", async () => {
     connect(async (call, send) => {
       const res = await send();
