@@ -12,6 +12,55 @@ export async function getCardState(db: D1Database, cardId: string): Promise<Card
 }
 
 /**
+ * 「読んだときの version がまだ生きている」ことを条件にした card_state の UPDATE 文。
+ * 1 文だけで使うなら saveCardState、他の文と同じ batch に混ぜるならこれを使う。
+ *
+ * `requireReviewId` を渡すと「その review_id の解答ログが、このカードの・この version からの
+ * ものである」ことも条件に加わる(= 同じ batch でログを入れた場合だけ state を進める)。
+ * 冪等キーが別のカードや別の version に使われていたら、INSERT が無視されるのと同時にこの UPDATE も
+ * 0 件になる。
+ */
+export function updateCardStateStatement(
+  db: D1Database,
+  next: CardStateRow,
+  expectedVersion: number,
+  requireReviewId?: string,
+): D1PreparedStatement {
+  if (next.version !== expectedVersion + 1) {
+    throw new Error(`version mismatch: expected ${expectedVersion + 1}, got ${next.version}`);
+  }
+  const guard =
+    requireReviewId === undefined
+      ? ""
+      : " AND EXISTS (SELECT 1 FROM reviews WHERE review_id = ? AND card_id = ? AND version_before = ?)";
+  return db
+    .prepare(
+      `UPDATE card_state
+       SET due = ?, stability = ?, difficulty = ?, elapsed_days = ?, scheduled_days = ?,
+           learning_steps = ?, reps = ?, lapses = ?, fsrs_state = ?, last_review = ?,
+           version = ?, updated_at = ?
+       WHERE card_id = ? AND version = ?${guard}`,
+    )
+    .bind(
+      next.due,
+      next.stability,
+      next.difficulty,
+      next.elapsed_days,
+      next.scheduled_days,
+      next.learning_steps,
+      next.reps,
+      next.lapses,
+      next.fsrs_state,
+      next.last_review,
+      next.version,
+      next.updated_at,
+      next.card_id,
+      expectedVersion,
+      ...(requireReviewId === undefined ? [] : [requireReviewId, next.card_id, expectedVersion]),
+    );
+}
+
+/**
  * FSRS 状態を楽観ロックで書く。
  * `expectedVersion` は読み出したときの version(行が無ければ 0)。`next.version` はその +1 でなければならない。
  * 他の更新が先に入っていた(= version が合わない)ときは何も書かずに false を返す。
@@ -52,30 +101,6 @@ export async function saveCardState(
     return inserted.meta.changes > 0;
   }
 
-  const updated = await db
-    .prepare(
-      `UPDATE card_state
-       SET due = ?, stability = ?, difficulty = ?, elapsed_days = ?, scheduled_days = ?,
-           learning_steps = ?, reps = ?, lapses = ?, fsrs_state = ?, last_review = ?,
-           version = ?, updated_at = ?
-       WHERE card_id = ? AND version = ?`,
-    )
-    .bind(
-      next.due,
-      next.stability,
-      next.difficulty,
-      next.elapsed_days,
-      next.scheduled_days,
-      next.learning_steps,
-      next.reps,
-      next.lapses,
-      next.fsrs_state,
-      next.last_review,
-      next.version,
-      next.updated_at,
-      next.card_id,
-      expectedVersion,
-    )
-    .run();
+  const updated = await updateCardStateStatement(db, next, expectedVersion).run();
   return updated.meta.changes > 0;
 }
