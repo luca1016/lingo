@@ -16,6 +16,7 @@ import {
 } from "./draft";
 import { buildPreview, canImport } from "./preview";
 import { Review } from "./Review";
+import { Stats } from "./Stats";
 
 const page = { fontFamily: "system-ui, sans-serif", padding: "16px", maxWidth: "640px" };
 const field = { display: "block", width: "100%", boxSizing: "border-box", padding: "8px" } as const;
@@ -25,7 +26,7 @@ const row = { borderBottom: "1px solid #ddd", padding: "6px 0", fontSize: "14px"
 const ng = { color: "#b00020" };
 const warn = { color: "#8a6d00" };
 
-type Mode = "single" | "paste" | "review";
+type Mode = "single" | "paste" | "review" | "stats";
 
 /** 草稿を更新する(useState の setter をそのまま渡す)。 */
 type SetDraft = (next: Draft | ((prev: Draft) => Draft)) => void;
@@ -37,6 +38,7 @@ const TABS: [Mode, string][] = [
   ["single", "単票追加"],
   ["paste", "貼り付け取り込み"],
   ["review", "復習"],
+  ["stats", "統計"],
 ];
 
 export function App() {
@@ -80,8 +82,10 @@ export function App() {
           previewed={previewed}
           setPreviewed={setPreviewed}
         />
-      ) : (
+      ) : mode === "review" ? (
         <Review />
+      ) : (
+        <Stats />
       )}
     </main>
   );

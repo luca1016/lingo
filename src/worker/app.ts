@@ -4,6 +4,7 @@ import { type AccessVariables, accessAuth, type JwksResolver, remoteJwks } from 
 import { postCards } from "./cards";
 import { jsonSameOrigin } from "./guard";
 import { getDue, postReview } from "./review";
+import { getStats } from "./stats";
 
 export interface AppOptions {
   /** JWKS 取得関数。テスト以外では指定しない(既定 = Access の公開 JWKS)。 */
@@ -28,6 +29,9 @@ export function createApp(options: AppOptions = {}) {
   // 復習エンジン(Issue 3)。
   app.get("/api/due", getDue);
   app.post("/api/review", postReview);
+
+  // 統計(Issue 5)。
+  app.get("/api/stats", getStats);
 
   // 残りの API の経路は以降の Issue でここに足す。
   app.all("/api/*", (c) => c.json({ error: "not_found" }, 404));

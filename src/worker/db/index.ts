@@ -6,6 +6,7 @@ export { countNewStartedBetween, type DueCardRow, listDueCards, nextDueAt } from
 export { findCardIdsByFront, getImport, insertImport } from "./imports";
 export { commitReview, getReview, insertReview } from "./reviews";
 export { getSettings } from "./settings";
+export { type CardCounts, countCardStats, listReviewDaysDesc } from "./stats";
 export type {
   CardRow,
   CardStateRow,
