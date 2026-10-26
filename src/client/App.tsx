@@ -1,14 +1,20 @@
-import { useState } from "preact/hooks";
+import { useMemo, useState } from "preact/hooks";
 import {
   type ImportResponse,
   MAX_CARDS_PER_IMPORT,
-  type NormalizedCard,
   normalizeRow,
-  normalizeRows,
   type RowError,
 } from "../shared/cards";
-import { newImportId, postCards } from "./api";
-import { parseCards } from "./parse";
+import {
+  type Draft,
+  type DraftContent,
+  editDraft,
+  isLocked,
+  newDraft,
+  resetDraft,
+  submitDraft,
+} from "./draft";
+import { buildPreview, canImport } from "./preview";
 
 const page = { fontFamily: "system-ui, sans-serif", padding: "16px", maxWidth: "640px" };
 const field = { display: "block", width: "100%", boxSizing: "border-box", padding: "8px" } as const;
@@ -80,62 +86,43 @@ function RowErrors({ errors }: { errors: readonly RowError[] }) {
   );
 }
 
-/** 送信中・失敗の表示をまとめた状態。 */
-interface SendState {
-  sending: boolean;
-  failure: string | null;
-  errors: RowError[];
-  result: ImportResponse | null;
+/** 送信の失敗・結果の表示(両方の画面で同じ)。 */
+function SendState({ draft }: { draft: Draft }) {
+  return (
+    <>
+      {draft.failure ? <p style={ng}>{draft.failure}</p> : null}
+      <RowErrors errors={draft.errors} />
+      {draft.result ? <ImportResult result={draft.result} /> : null}
+    </>
+  );
 }
 
-const IDLE: SendState = { sending: false, failure: null, errors: [], result: null };
-
-async function send(
-  importId: string,
-  cards: readonly NormalizedCard[],
-  setState: (next: SendState) => void,
-): Promise<boolean> {
-  setState({ ...IDLE, sending: true });
-  try {
-    const res = await postCards(importId, cards);
-    if (res.ok) {
-      setState({ ...IDLE, result: res.response });
-      return true;
-    }
-    setState({
-      ...IDLE,
-      failure: `${res.error.message}(${res.error.error})`,
-      errors: res.error.errors ?? [],
-    });
-  } catch (cause) {
-    // postCards は例外を出さない作りだが、万一出ても送信中のまま固まらせない
-    //(import_id と入力は呼び出し側が保持しているので、そのまま再送できる)。
-    setState({ ...IDLE, failure: `送信できなかった(${String(cause)})` });
-  }
-  return false;
-}
+const EMPTY_CARD: DraftContent = { front: "", back: "", example: "", note: "" };
 
 function SingleCard() {
-  const [values, setValues] = useState({ front: "", back: "", example: "", note: "" });
-  const [importId, setImportId] = useState(newImportId);
-  const [state, setState] = useState<SendState>(IDLE);
-
-  const local = normalizeRow(values, 1);
+  const [draft, setDraft] = useState(() => newDraft(EMPTY_CARD));
   const [showErrors, setShowErrors] = useState(false);
+  const values = draft.content;
+  const local = normalizeRow(values, 1);
+  const locked = isLocked(draft);
 
   const submit = async (event: Event) => {
     event.preventDefault();
     setShowErrors(true);
-    if (!local.card) return;
-    if (await send(importId, [local.card], setState)) {
-      // 追加できたら次の 1 枚へ。冪等キーも新しくする(同じキーの再送は増やさないため)。
-      setValues({ front: "", back: "", example: "", note: "" });
-      setImportId(newImportId());
+    if (locked || !local.card) return;
+    if (await submitDraft(draft, [local.card], setDraft)) {
+      // 追加できたら次の 1 枚へ。内容が変わるので import_id も新しくなる(同じキーの再送は増やさない)。
+      setDraft((prev) => resetDraft(prev, EMPTY_CARD));
       setShowErrors(false);
     }
   };
 
-  const input = (name: keyof typeof values, text: string, rows?: number) => (
+  const edit = (name: string) => (event: { currentTarget: { value: string } }) => {
+    const value = event.currentTarget.value;
+    setDraft((prev) => editDraft(prev, { ...prev.content, [name]: value }));
+  };
+
+  const input = (name: keyof typeof EMPTY_CARD, text: string, rows?: number) => (
     <label style={label}>
       {text}
       {rows ? (
@@ -143,14 +130,11 @@ function SingleCard() {
           style={field}
           rows={rows}
           value={values[name]}
-          onInput={(e) => setValues({ ...values, [name]: e.currentTarget.value })}
+          disabled={locked}
+          onInput={edit(name)}
         />
       ) : (
-        <input
-          style={field}
-          value={values[name]}
-          onInput={(e) => setValues({ ...values, [name]: e.currentTarget.value })}
-        />
+        <input style={field} value={values[name]} disabled={locked} onInput={edit(name)} />
       )}
     </label>
   );
@@ -163,56 +147,33 @@ function SingleCard() {
       {input("example", "例文(任意)", 2)}
       {input("note", "メモ(任意)", 2)}
       {showErrors ? <RowErrors errors={local.errors} /> : null}
-      <button type="submit" style={button} disabled={state.sending}>
-        {state.sending ? "送信中…" : "追加する"}
+      <button type="submit" style={button} disabled={locked}>
+        {locked ? "送信中…" : "追加する"}
       </button>
-      {state.failure ? <p style={ng}>{state.failure}</p> : null}
-      <RowErrors errors={state.errors} />
-      {state.result ? <ImportResult result={state.result} /> : null}
+      {locked ? <p style={{ fontSize: "14px" }}>送信が終わるまで入力は変えられない</p> : null}
+      <SendState draft={draft} />
     </form>
   );
 }
 
-interface Preview {
-  importId: string;
-  cards: NormalizedCard[];
-  errors: RowError[];
-  /** 行ごとの表示(検証結果つき)。 */
-  rows: { row: number; front: string; back: string; errors: RowError[] }[];
-  delimiter: string;
-  header: string[] | null;
-  tooMany: boolean;
-}
-
-function buildPreview(text: string): Preview {
-  const parsed = parseCards(text);
-  const { cards, errors } = normalizeRows(parsed.rows);
-  return {
-    importId: newImportId(),
-    cards,
-    errors,
-    rows: parsed.rows.map((r, index) => ({
-      row: index + 1,
-      front: String(r.front ?? ""),
-      back: String(r.back ?? ""),
-      errors: errors.filter((e) => e.row === index + 1),
-    })),
-    delimiter: parsed.delimiter === "\t" ? "TSV(タブ区切り)" : "CSV(カンマ区切り)",
-    header: parsed.header,
-    tooMany: parsed.rows.length > MAX_CARDS_PER_IMPORT,
-  };
-}
+const EMPTY_PASTE: DraftContent = { text: "" };
 
 function PasteImport() {
-  const [text, setText] = useState("");
-  const [preview, setPreview] = useState<Preview | null>(null);
-  const [state, setState] = useState<SendState>(IDLE);
+  const [draft, setDraft] = useState(() => newDraft(EMPTY_PASTE));
+  // プレビューした時点の文字列。いまの入力と一致しているあいだだけプレビューを出す
+  //(入力を変えたら import_id も変わるので、古いプレビューの内容を送らないようにする)。
+  const [previewed, setPreviewed] = useState<string | null>(null);
+  const text = draft.content.text ?? "";
+  const locked = isLocked(draft);
+  const fresh = previewed !== null && previewed === text;
+  const preview = useMemo(() => (fresh ? buildPreview(text) : null), [fresh, text]);
 
   const confirm = async () => {
-    if (!preview || preview.errors.length > 0 || preview.tooMany || preview.cards.length === 0) {
-      return;
+    if (locked || !preview || !canImport(preview)) return;
+    if (await submitDraft(draft, preview.cards, setDraft)) {
+      setPreviewed(null);
+      setDraft((prev) => resetDraft(prev, EMPTY_PASTE));
     }
-    if (await send(preview.importId, preview.cards, setState)) setPreview(null);
   };
 
   return (
@@ -226,18 +187,19 @@ function PasteImport() {
         style={{ ...field, fontFamily: "monospace" }}
         rows={8}
         value={text}
-        onInput={(e) => setText(e.currentTarget.value)}
-      />
-      <button
-        type="button"
-        style={button}
-        onClick={() => {
-          setState(IDLE);
-          setPreview(buildPreview(text));
+        disabled={locked}
+        onInput={(e) => {
+          const value = e.currentTarget.value;
+          setDraft((prev) => editDraft(prev, { text: value }));
         }}
-      >
+      />
+      <button type="button" style={button} disabled={locked} onClick={() => setPreviewed(text)}>
         プレビュー
       </button>
+      {locked ? <p style={{ fontSize: "14px" }}>送信が終わるまで入力は変えられない</p> : null}
+      {previewed !== null && !fresh ? (
+        <p style={ng}>入力が変わった。もう一度プレビューしてから取り込む</p>
+      ) : null}
 
       {preview ? (
         <section>
@@ -268,22 +230,15 @@ function PasteImport() {
           <button
             type="button"
             style={button}
-            disabled={
-              state.sending ||
-              preview.errors.length > 0 ||
-              preview.tooMany ||
-              preview.cards.length === 0
-            }
+            disabled={locked || !canImport(preview)}
             onClick={confirm}
           >
-            {state.sending ? "送信中…" : `${preview.cards.length} 件を取り込む`}
+            {locked ? "送信中…" : `${preview.cards.length} 件を取り込む`}
           </button>
         </section>
       ) : null}
 
-      {state.failure ? <p style={ng}>{state.failure}</p> : null}
-      <RowErrors errors={state.errors} />
-      {state.result ? <ImportResult result={state.result} /> : null}
+      <SendState draft={draft} />
     </section>
   );
 }
