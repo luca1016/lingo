@@ -11,6 +11,9 @@ export default defineConfig({
       },
     })),
   ],
+  // 画面のテスト(test/app.test.ts)は src/client の .tsx を読み込む。
+  // 本番の束ね(vite.config.ts)と同じく JSX は preact へ向ける。
+  oxc: { jsx: { runtime: "automatic", importSource: "preact" } },
   test: {
     include: ["test/**/*.test.ts"],
     setupFiles: ["./test/apply-migrations.ts"],
