@@ -63,3 +63,24 @@ export function dayWindow(now: Date, timeZone: string): { start: Date; end: Date
   const end = startOfZonedDay(new Date(start.getTime() + DAY_MS + DAY_MS / 2), timeZone);
   return { start, end };
 }
+
+/** その瞬間を含むカレンダー日(その土地の壁時計)の "YYYY-MM-DD"。日をまたぐ数え方の鍵に使う。 */
+export function zoneDateKey(at: Date, timeZone: string): string {
+  const wall = new Date(at.getTime() + zoneOffsetMs(at, timeZone));
+  return toUtcIso(wall).slice(0, 10);
+}
+
+/** `zoneDateKey` の 1 日前(カレンダー日の引き算。連続日数を前へたどるのに使う)。 */
+export function previousDateKey(key: string): string {
+  const ms = Date.parse(`${key}T00:00:00.000Z`);
+  if (Number.isNaN(ms)) throw new RangeError(`invalid date key: ${key}`);
+  return new Date(ms - DAY_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * `at` の瞬間における `timeZone` の UTC からのずれ(分)。
+ * 保存値(UTC)を SQL の側でカレンダー日にまとめるときの修飾子に使う。
+ */
+export function zoneOffsetMinutes(at: Date, timeZone: string): number {
+  return Math.round(zoneOffsetMs(at, timeZone) / 60000);
+}
