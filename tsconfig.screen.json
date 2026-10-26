@@ -1,0 +1,20 @@
+{
+  // 画面(JSX + DOM)と実 API(workerd)を一緒に動かすテスト。
+  // 両方の型が要るのでここだけ別に見る(フロントの tsconfig.client.json には Worker の型を入れない)。
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["./worker-configuration.d.ts", "@cloudflare/vitest-plugin/types"]
+  },
+  "include": ["src", "test/review-screen.test.ts", "test/dom.ts", "test/access-harness.ts"]
+}

@@ -165,6 +165,12 @@ options.debounceRendering = (process) => {
   pending.push(process);
 };
 
+// useEffect の掃き出しも同じ列に積む。preact は requestAnimationFrame が無いと 35ms 待ってから
+// 流すので、それを待たずに flush() で拾えるようにする(useLayoutEffect は commit 時に走るので対象外)。
+options.requestAnimationFrame = (process) => {
+  pending.push(process);
+};
+
 /** 溜まっている再描画と、送信の続き(応答本文の読み取りを含む)を流し切る。 */
 export async function flush(): Promise<void> {
   for (let i = 0; i < 10; i++) {

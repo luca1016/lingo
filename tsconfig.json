@@ -20,6 +20,6 @@
     "vite.config.ts",
     "vitest.config.ts"
   ],
-  // 画面(JSX + DOM)を触るテストは tsconfig.client.json の側で見る。
-  "exclude": ["test/app.test.ts", "test/dom.ts"]
+  // 画面(JSX + DOM)を触るテストは tsconfig.client.json / tsconfig.screen.json の側で見る。
+  "exclude": ["test/app.test.ts", "test/dom.ts", "test/review-screen.test.ts"]
 }
