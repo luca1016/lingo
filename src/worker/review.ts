@@ -123,7 +123,8 @@ function replayResponse(row: ReviewRow): ReviewResponse {
 /**
  * POST /api/review — 評価を 1 件確定する。
  *
- * - `review_id` で冪等。同じ id の再送には 1 回目とまったく同じ応答を返し、reviews も state も変えない。
+ * - `review_id` で冪等。同じ id の再送には 1 回目とまったく同じ応答を返し、reviews も state も変えない
+ *   (同時送信で 1 回目が途中に割り込んだ場合も、409 ではなく 1 回目の結果を返す)。
  * - `expected_version` が今の card_state.version と違えば 409(何も変えない)。
  * - 成功時は 1 つの batch で「reviews の INSERT + 条件付き UPDATE」を流し、UPDATE が 0 件なら 409。
  * - FSRS の計算は純関数(`applyReview`)に任せ、ここは HTTP と D1 の面倒だけを見る。
@@ -150,6 +151,10 @@ export const postReview: Handler<AppEnv> = async (c) => {
   if (!state) return c.json(failure("card_not_found", "そのカードの FSRS 状態が無い"), 404);
 
   if (state.version !== request.expected_version) {
+    // ログを引いてから state を読むまでに、同じ review_id の 1 回目が確定していることがある。
+    // その場合は version のずれではなく再送なので、1 回目の結果を返す。
+    const raced = await getReview(c.env.DB, request.review_id);
+    if (raced) return c.json(replayResponse(raced), 200);
     return c.json(conflict(state), 409);
   }
 

@@ -273,17 +273,15 @@ describe("POST /api/review(競合)", () => {
 });
 
 /**
- * 「読んでから書くまで」の隙に別の評価を割り込ませる D1。
- * settings を読んだ直後(= version を確かめた後、batch を流す前)に 1 回だけ割り込む。
+ * 「読んでから書くまで」の隙に割り込みを入れる D1。
+ * `match` を含む問い合わせの first() が返った直後に、1 回だけ `interrupt` を流す。
  */
-function dbRacingAfterSettings(cardId: string): D1Database {
+function dbRacingAfterRead(match: string, interrupt: () => Promise<unknown>): D1Database {
   let raced = false;
   const race = async () => {
     if (raced) return;
     raced = true;
-    await env.DB.prepare("UPDATE card_state SET version = version + 1 WHERE card_id = ?")
-      .bind(cardId)
-      .run();
+    await interrupt();
   };
 
   const hooked = (statement: D1PreparedStatement): D1PreparedStatement =>
@@ -311,10 +309,36 @@ function dbRacingAfterSettings(cardId: string): D1Database {
       if (prop !== "prepare") return Reflect.get(target, prop, receiver);
       return (query: string) => {
         const statement = target.prepare(query);
-        return query.includes("FROM settings") ? hooked(statement) : statement;
+        return query.includes(match) ? hooked(statement) : statement;
       };
     },
   });
+}
+
+/** settings を読んだ直後(= version を確かめた後、batch を流す前)に別の評価を割り込ませる D1。 */
+function dbRacingAfterSettings(cardId: string): D1Database {
+  return dbRacingAfterRead("FROM settings", () =>
+    env.DB.prepare("UPDATE card_state SET version = version + 1 WHERE card_id = ?")
+      .bind(cardId)
+      .run(),
+  );
+}
+
+/** 差し替えた D1 で評価を 1 件送る(本文はそのまま使う)。 */
+async function sendReviewWithDb(db: D1Database, body: unknown): Promise<Response> {
+  return await harness.app.request(
+    `${ORIGIN}/api/review`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: {
+        "Content-Type": "application/json",
+        Origin: ORIGIN,
+        "Cf-Access-Jwt-Assertion": harness.jwt,
+      },
+    },
+    { ...harness.env, DB: db },
+  );
 }
 
 describe("POST /api/review(条件付き UPDATE が 0 件)", () => {
@@ -322,31 +346,95 @@ describe("POST /api/review(条件付き UPDATE が 0 件)", () => {
     const cardId = await importOne();
     const before = await stateOf(cardId);
 
-    const res = await harness.app.request(
-      `${ORIGIN}/api/review`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          review_id: "interleaved",
-          card_id: cardId,
-          rating: 3,
-          expected_version: 1,
-          occurred_at: toUtcIso(NOW),
-        }),
-        headers: {
-          "Content-Type": "application/json",
-          Origin: ORIGIN,
-          "Cf-Access-Jwt-Assertion": harness.jwt,
-        },
-      },
-      { ...harness.env, DB: dbRacingAfterSettings(cardId) },
-    );
+    const res = await sendReviewWithDb(dbRacingAfterSettings(cardId), {
+      review_id: "interleaved",
+      card_id: cardId,
+      rating: 3,
+      expected_version: 1,
+      occurred_at: toUtcIso(NOW),
+    });
 
     expect(res.status).toBe(409);
     expect((await res.json<ReviewErrorResponse>()).error).toBe("version_conflict");
     // 割り込んだ更新(version +1)以外は何も起きていない。reviews は空のまま。
     expect(await countReviews()).toBe(0);
     expect(await stateOf(cardId)).toEqual({ ...before, version: 2 });
+  });
+});
+
+describe("POST /api/review(同じ review_id の同時送信)", () => {
+  it("ログを引いた後に 1 回目が確定しても、409 ではなく 1 回目と同じ応答を返す", async () => {
+    const cardId = await importOne();
+    let firstBody: ReviewResponse | undefined;
+    // reviews を引いた直後(= 未登録を確かめた後、state を読む前)に 1 回目を確定させる。
+    const db = dbRacingAfterRead("FROM reviews WHERE review_id", async () => {
+      const first = await sendReview({ cardId, version: 1, reviewId: "double-send", rating: 1 });
+      expect(first.status).toBe(200);
+      firstBody = await first.json<ReviewResponse>();
+    });
+
+    const res = await sendReviewWithDb(db, {
+      review_id: "double-send",
+      card_id: cardId,
+      rating: 1,
+      expected_version: 1,
+      occurred_at: toUtcIso(NOW),
+      elapsed_ms: 4200,
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json<ReviewResponse>()).toEqual(firstBody);
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2, due: firstBody?.state.due });
+  });
+
+  it("同じ review_id を別のカードで送っても、2 枚目の state は進まない", async () => {
+    const ids = await importCards(["invoice", "ledger"]);
+    const winner = ids.get("invoice") as string;
+    const loser = ids.get("ledger") as string;
+    let firstBody: ReviewResponse | undefined;
+    // 1 枚目が先に同じ review_id を使い切る。2 枚目は version が合っているので batch まで進む。
+    const db = dbRacingAfterRead("FROM reviews WHERE review_id", async () => {
+      const first = await sendReview({ cardId: winner, version: 1, reviewId: "shared-id" });
+      expect(first.status).toBe(200);
+      firstBody = await first.json<ReviewResponse>();
+    });
+
+    const res = await sendReviewWithDb(db, {
+      review_id: "shared-id",
+      card_id: loser,
+      rating: 3,
+      expected_version: 1,
+      occurred_at: toUtcIso(NOW),
+    });
+
+    // 同じ冪等キーには同じ応答。ログは 1 行だけで、2 枚目の state は新規のまま。
+    expect(res.status).toBe(200);
+    expect(await res.json<ReviewResponse>()).toEqual(firstBody);
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(loser)).toMatchObject({ version: 1, fsrs_state: State.New, reps: 0 });
+    expect(await stateOf(winner)).toMatchObject({ version: 2 });
+  });
+
+  it("同じ review_id を 2 枚のカードへ同時に送っても、進むのは片方だけ", async () => {
+    const ids = await importCards(["invoice", "ledger"]);
+    const one = ids.get("invoice") as string;
+    const other = ids.get("ledger") as string;
+
+    const [a, b] = await Promise.all([
+      sendReview({ cardId: one, version: 1, reviewId: "shared-id" }),
+      sendReview({ cardId: other, version: 1, reviewId: "shared-id" }),
+    ]);
+
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const bodyA = await a.json<ReviewResponse>();
+    expect(await b.json<ReviewResponse>()).toEqual(bodyA);
+    expect(await countReviews()).toBe(1);
+    // 応答に入っているカードだけが 1 回分進み、もう片方は新規のまま。
+    const advanced = bodyA.card_id === one ? one : other;
+    const untouched = advanced === one ? other : one;
+    expect(await stateOf(advanced)).toMatchObject({ version: 2 });
+    expect(await stateOf(untouched)).toMatchObject({ version: 1, fsrs_state: State.New, reps: 0 });
   });
 });
 
