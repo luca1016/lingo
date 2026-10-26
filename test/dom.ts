@@ -187,6 +187,11 @@ export function mount(vnode: ComponentChild): FakeElement {
   return root;
 }
 
+/** 画面を外す(アンマウント → 再マウントで状態が残るかを見るため)。 */
+export function unmount(root: FakeElement): void {
+  render(null, root as unknown as Element & { __k?: unknown });
+}
+
 function walk(node: FakeNode, out: FakeElement[]): FakeElement[] {
   if (node instanceof FakeElement) out.push(node);
   for (const child of node.childNodes) walk(child, out);

@@ -1,26 +1,28 @@
-// 復習画面(src/client/Review.tsx)を実画面として描画し、実 API(workerd + ローカル D1)に繋いで動かす。
-// 画面の fetch をそのまま Worker(Hono)へ渡し、ブラウザと Access の代わりに Origin と JWT を足す
-//(差し替えるのは JWKS 取得関数だけ = test/access-harness.ts。検証経路は本番と同じ)。
+// 復習画面(src/client/Review.tsx + src/client/review.ts のストア)を実画面として描画し、
+// 実 API(workerd + ローカル D1)に繋いで動かす。画面の fetch をそのまま Worker(Hono)へ渡し、
+// ブラウザと Access の代わりに Origin と JWT を足す(差し替えるのは JWKS 取得関数だけ
+// = test/access-harness.ts。検証経路は本番と同じ)。
 //
-// ここで押さえること(Issue 5):
-//  - 応答が消えたあとの再送で二重評価にならない(同じ review_id で送る)
-//  - 409 なら due を取り直して続ける
+// ここで押さえること(Issue 5 と設計の差し替え 4 回目):
+//  - 残り枚数 → 表 → めくる → 評価 / 送信中は評価ボタンが無効
+//  - 応答が消えたあとの再送で二重評価にならない(同じ review_id・同じ expected_version)
+//  - 未確定の 1 件があるあいだは再送しかできない(別カードの評価・取得・タブ復帰での差し替えが無い)
+//  - 409 は確定として扱い、最新を取り直して続ける
 //  - 認証切れ(401)は再ログインを案内し、再送ループにしない
-//  - 短期カード(学習ステップ)の待ち時間を出し、時間が来たら出し直す(固定時計)
-//  - 送信中は評価ボタンが無効
-//  - 取得の世代管理(古い応答で送信状態・再送キー・短期カードを失わない / 取得中は重ねて出さない)
-//  - 結果が未確定のあいだは他のカードに進めず、同じ attempt の再送だけで確定する(不変条件 A・B・C)
+//  - 取得中は GET を重ねて出さない / 表示中は GET を出さない(表示中のカードが入れ替わらない)
+//  - 短期カード(学習ステップ)は next_due_at で待ち時間を出し、時間が来たらサーバーから出し直す
+//  - アンマウント → 再マウントで状態(表示中・送信中・未確定)が残る
 
 import { env } from "cloudflare:workers";
 import { h } from "preact";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/client/App";
-import { loadDue, newSession, type Session, type SetSession } from "../src/client/review";
+import { resetSession } from "../src/client/review";
 import type { ImportResponse } from "../src/shared/cards";
 import type { DueResponse } from "../src/shared/review";
 import { toUtcIso } from "../src/worker/time";
 import { type AccessHarness, createAccessHarness, ORIGIN } from "./access-harness";
-import { buttonByText, byTag, click, flush, mount, textOf } from "./dom";
+import { buttonByText, byTag, click, type FakeElement, flush, mount, textOf, unmount } from "./dom";
 
 // 固定時計(JST では 2026-10-26 10:23)。Date と setInterval だけを偽物にする
 //(flush() の setTimeout は本物のまま使いたい)。
@@ -28,6 +30,8 @@ const NOW = new Date("2026-10-26T01:23:45.000Z");
 const MINUTE = 60 * 1000;
 
 const RATING_LABELS = ["Again", "Hard", "Good", "Easy"];
+const ALL_DISABLED = [true, true, true, true];
+const ALL_ENABLED = [false, false, false, false];
 
 interface SentCall {
   method: string;
@@ -57,6 +61,8 @@ beforeEach(async () => {
   vi.setSystemTime(NOW);
   jwt = harness.jwt;
   calls = [];
+  // ストアは画面の外にあるので、テストごとに初期状態へ戻す。
+  resetSession();
   await env.DB.batch([
     env.DB.prepare("DELETE FROM reviews"),
     env.DB.prepare("DELETE FROM card_state"),
@@ -66,6 +72,9 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  // 描いた画面は外す(残したままだとストアを購読し続け、次のテストの取得に割り込む)。
+  for (const root of mounted) unmount(root);
+  mounted = [];
   vi.unstubAllGlobals();
 });
 
@@ -104,7 +113,20 @@ function connect(behave: Behave = (_call, send) => send()): void {
   );
 }
 
-/** 解決を自分で起こせる関門(「送信中」の画面を観察するため)。 */
+/** 要求はサーバに届くが、応答だけが消える(先頭 `times` 回)。 */
+function losePostResponse(times = 1): void {
+  let lost = 0;
+  connect(async (call, send) => {
+    const res = await send(); // 要求はサーバに届いている
+    if (call.path === "/api/review" && lost < times) {
+      lost += 1;
+      throw new TypeError("Network connection lost.");
+    }
+    return res;
+  });
+}
+
+/** 解決を自分で起こせる関門(「送信中」や「取得中」の画面を観察するため)。 */
 function gate(): { wait: Promise<void>; open: () => void } {
   let open: () => void = () => {};
   const wait = new Promise<void>((resolve) => {
@@ -113,23 +135,45 @@ function gate(): { wait: Promise<void>; open: () => void } {
   return { wait, open };
 }
 
+/** 描いた画面の根(テストの終わりに外す)。 */
+let mounted: FakeElement[] = [];
+
 function screen() {
   const root = mount(h(App, null));
+  mounted.push(root);
   return {
     root,
     text: () => textOf(root),
     /** 評価ボタン(Again / Hard / Good / Easy)。 */
     ratings: () => byTag(root, "button").filter((b) => RATING_LABELS.includes(textOf(b))),
+    disabled: () =>
+      byTag(root, "button")
+        .filter((b) => RATING_LABELS.includes(textOf(b)))
+        .map((b) => b.disabled),
     has: (text: string) => byTag(root, "button").some((b) => textOf(b).includes(text)),
   };
 }
 
-/** 復習タブを開き、最初の出題を取り終えるまで待つ。 */
+/** 復習タブを開く(最初の取得が終わるまで待つ)。 */
 async function openReview() {
   const s = screen();
   await click(buttonByText(s.root, "復習"));
   await flush();
   return s;
+}
+
+/** 別のタブへ行って戻る(復習画面は作り直される = MOUNT)。 */
+async function roundTrip(s: ReturnType<typeof screen>) {
+  await click(buttonByText(s.root, "単票追加"));
+  await click(buttonByText(s.root, "復習"));
+  await flush();
+}
+
+/** 画面を外して作り直す(ストアに状態が残っているかを見る)。 */
+async function remount(s: ReturnType<typeof screen>) {
+  unmount(s.root);
+  await flush();
+  return await openReview();
 }
 
 /** めくって評価する。 */
@@ -197,6 +241,18 @@ async function serverDue(): Promise<DueResponse> {
   return await res.json<DueResponse>();
 }
 
+/** サーバが出す順に front を並べる(A = 1 枚目、B = 2 枚目)。 */
+async function twoCards(): Promise<{
+  a: string;
+  b: string;
+  aId: string;
+  bId: string;
+}> {
+  const ids = await importCards(["invoice", "ledger"]);
+  const [a, b] = (await serverDue()).cards.map((c) => c.front) as [string, string];
+  return { a, b, aId: ids.get(a) as string, bId: ids.get(b) as string };
+}
+
 async function countReviews(): Promise<number> {
   const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM reviews").first<{ n: number }>();
   return row?.n ?? 0;
@@ -218,8 +274,8 @@ function reviewBodies(): Record<string, unknown>[] {
     .map((c) => c.body as Record<string, unknown>);
 }
 
-describe("復習画面(実 API)", () => {
-  it("残り枚数 → 表 → めくる → 評価 の順に進む", async () => {
+describe("復習画面(基本)", () => {
+  it("残り枚数 → 表 → めくる → 評価 の順に進み、確定したらサーバに訊き直す", async () => {
     connect();
     const cardId = await importOne();
 
@@ -233,211 +289,92 @@ describe("復習画面(実 API)", () => {
     await click(buttonByText(s.root, "めくる"));
     expect(s.text()).toContain("invoice の意味");
     expect(s.ratings().map((b) => textOf(b))).toEqual(RATING_LABELS);
+    expect(s.disabled()).toEqual(ALL_ENABLED);
 
     await click(buttonByText(s.root, "Good"));
-    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
+    // 確定したら手元には何も残さず、次の 1 枚をサーバに訊く。
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
     expect(await countReviews()).toBe(1);
     expect(await stateOf(cardId)).toMatchObject({ version: 2 });
-    // 1 枚しか無かったので、次は短期カードの待ちになる。
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain("つぎのカードまで");
+    // 1 枚しか無かったので、次は学習ステップ(10 分)の待ちになる。
+    expect(s.text()).toContain("残り 0 枚");
+    expect(s.text()).toContain("つぎのカードまで あと 10 分 0 秒");
   });
 
-  it("応答が消えても同じ review_id で再送し、二重評価にならない", async () => {
-    let lost = 0;
+  it("送信中は評価ボタンが無効で、押し直しても二重に送らない", async () => {
+    const held = gate();
     connect(async (call, send) => {
-      const res = await send(); // 要求はサーバに届いている
-      if (call.path === "/api/review" && lost < 2) {
-        lost += 1;
-        throw new TypeError("Network connection lost.");
-      }
-      return res;
+      if (call.path === "/api/review") await held.wait;
+      return await send();
     });
     const cardId = await importOne();
 
     const s = await openReview();
     await answer(s, "Good");
-    expect(s.text()).toContain("通信できなかった");
-    expect(s.text()).toContain("同じ評価をもう一度送れる");
 
-    // 同じ評価を押し直しても、再送ボタンからでも、同じ review_id で同じ本文を送る。
-    await click(buttonByText(s.root, "Good"));
-    expect(s.text()).toContain("通信できなかった");
-    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+    expect(s.text()).toContain("送信中は評価を受け付けない");
+    for (const label of RATING_LABELS) await click(buttonByText(s.root, label));
+    expect(reviewBodies()).toHaveLength(1);
 
+    held.open();
+    await flush();
+    expect(reviewBodies()).toHaveLength(1);
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+  });
+
+  it("応答が消えても同じ review_id で再送し、二重評価にならない", async () => {
+    losePostResponse(2);
+    const cardId = await importOne();
+
+    const s = await openReview();
+    await answer(s, "Good");
+    expect(s.text()).toContain("送信を確認できません");
+    expect(s.text()).toContain("通信できなかった");
+
+    // 未確定のあいだ、押せるのは再送だけ(評価ボタンは全部無効)。
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+    await click(buttonByText(s.root, "再送"));
+    expect(s.text()).toContain("送信を確認できません");
+    await click(buttonByText(s.root, "再送"));
+
+    // 3 回とも同じ本文(同じ review_id・同じ expected_version)。
     const bodies = reviewBodies();
     expect(bodies).toHaveLength(3);
     expect(new Set(bodies.map((b) => b.review_id)).size).toBe(1);
-    expect(bodies[0]).toEqual(bodies[1]);
-    expect(bodies[0]).toEqual(bodies[2]);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[2]).toEqual(bodies[0]);
 
     // サーバには 1 回分だけ入り、画面も 1 回分だけ進む。
     expect(await countReviews()).toBe(1);
     expect(await stateOf(cardId)).toMatchObject({ version: 2 });
-    expect(s.text()).not.toContain("通信できなかった");
+    expect(s.text()).not.toContain("送信を確認できません");
     expect(s.text()).toContain("つぎのカードまで");
   });
 
-  it("応答が消えたまま往復しても、同じ review_id で確定して短期カードが戻る", async () => {
-    let lost = 0;
-    connect(async (call, send) => {
-      const res = await send(); // 要求はサーバに届いている
-      if (call.path === "/api/review" && lost < 1) {
-        lost += 1;
-        throw new TypeError("Network connection lost.");
-      }
-      return res;
-    });
-    const cardId = await importOne();
-
-    const s = await openReview();
-    await answer(s, "Again"); // 届いているので 1 分後へ進んでいる
-    expect(s.text()).toContain("通信できなかった");
-    expect(await countReviews()).toBe(1);
-
-    // タブを往復しても、送った 1 件は捨てない。サーバはこのカードをまだ出さない(期限は 1 分後)
-    // ので、ここで手元から落とすと再送先も待ち時間も失う。
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
-    await flush();
-    expect((await serverDue()).cards).toEqual([]);
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain("通信できなかった");
-    expect(s.has("同じ評価をもう一度送る")).toBe(true);
-
-    // 同じ review_id で送り直すと、サーバは 1 回目の結果をそのまま返す(二重評価にならない)。
-    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
-    const bodies = reviewBodies();
-    expect(bodies).toHaveLength(2);
-    expect(new Set(bodies.map((b) => b.review_id)).size).toBe(1);
-    expect(bodies[0]).toEqual(bodies[1]);
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(cardId)).toMatchObject({
-      version: 2,
-      due: toUtcIso(new Date(NOW.getTime() + MINUTE)),
-    });
-
-    // 確定した結果で待ち時間が戻り、時間が来たら同じ画面で出る。
-    expect(s.text()).not.toContain("通信できなかった");
-    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
-    vi.advanceTimersByTime(MINUTE);
-    await flush();
-    expect(s.text()).toContain("invoice");
-    expect(s.has("めくる")).toBe(true);
-  });
-
-  it("送信中にタブを往復しても、取り直しが送信の結果を上書きしない", async () => {
-    const held = gate();
-    const refetch = gate();
-    let gets = 0;
-    connect(async (call, send) => {
-      if (call.path === "/api/review") await held.wait;
-      // 送信中に始まった 2 回目以降の取得は、送信より後に返す(古い応答で上書きされないか見る)。
-      else if ((gets += 1) > 1) await refetch.wait;
-      return await send();
-    });
-    const ids = await importCards(["invoice", "ledger"]);
-    const order = (await serverDue()).cards.map((c) => c.front);
-    const first = ids.get(order[0] as string) as string;
-
-    const s = await openReview();
-    await answer(s, "Good");
-    expect(s.ratings().map((b) => b.disabled)).toEqual([true, true, true, true]);
-
-    // 別のタブへ行って戻る(復習画面は作り直される)。送信中なので取り直しはしない。
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
-    await flush();
-    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
-
-    // 送信 → 取得 の順に応答を返す(取得が後から返っても送信後の状態を壊さない)。
-    held.open();
-    await flush();
-    refetch.open();
-    await flush();
-
-    // 送信は終わっている。通信中でないのにボタンが無効のまま、にはならない。
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(first)).toMatchObject({ version: 2 });
-    expect(s.text()).toContain(order[1] as string);
-    await click(buttonByText(s.root, "めくる"));
-    expect(s.ratings().map((b) => b.disabled)).toEqual([false, false, false, false]);
-
-    // そのまま 2 枚目を評価できる。
-    await click(buttonByText(s.root, "Good"));
-    expect(await countReviews()).toBe(2);
-  });
-
-  it("結果が未確定のあいだは評価を変えて送れず、確定したら新しい review_id で送る", async () => {
-    connect(async (call, send) => {
-      const res = await send();
-      if (call.path === "/api/review" && reviewBodies().length === 1) {
-        throw new TypeError("Network connection lost.");
-      }
-      return res;
-    });
-    const cardId = await importOne();
-
-    const s = await openReview();
-    await answer(s, "Good"); // 届いたが応答が消えた
-    expect(s.text()).toContain("通信できなかった");
-
-    // 押せるのは同じ評価(= 同じ attempt の再送)だけ。別の評価に変えると、1 回目が
-    // 届いていた場合に二重評価か 409 かが分からなくなるので、受け付けない(不変条件 A)。
-    expect(s.ratings().map((b) => [textOf(b), b.disabled])).toEqual([
-      ["Again", true],
-      ["Hard", true],
-      ["Good", false],
-      ["Easy", true],
-    ]);
-    await click(buttonByText(s.root, "Again"));
-    expect(reviewBodies()).toHaveLength(1);
-    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
-
-    // 再送すると同じ review_id で確定する(サーバには 1 回分だけ)。
-    await click(buttonByText(s.root, "Good"));
-    const bodies = reviewBodies();
-    expect(bodies).toHaveLength(2);
-    expect(bodies[1]).toEqual(bodies[0]);
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
-
-    // 確定したあとの評価は別の要求なので、新しい review_id・新しい version で送る。
-    vi.advanceTimersByTime(10 * MINUTE);
-    await flush();
-    await answer(s, "Again");
-    const next = reviewBodies().at(-1);
-    expect(next?.review_id).not.toBe(bodies[0]?.review_id);
-    expect(next).toMatchObject({ card_id: cardId, rating: 1, expected_version: 2 });
-    expect(await countReviews()).toBe(2);
-  });
-
-  it("409 なら due を取り直して続ける", async () => {
+  it("409 は確定として扱い、最新を取り直して続ける", async () => {
     connect();
-    const ids = await importCards(["invoice", "ledger"]);
-    const order = (await serverDue()).cards.map((c) => c.front);
-    const first = ids.get(order[0] as string) as string;
+    const { a, b, aId, bId } = await twoCards();
 
     const s = await openReview();
     expect(s.text()).toContain("残り 2 枚");
+    expect(s.text()).toContain(a);
 
     // 画面が持っている version を、別の経路からの評価で古くする。
-    await reviewElsewhere(first, 1);
+    await reviewElsewhere(aId, 1);
 
     await answer(s, "Good");
     expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
-    expect(s.text()).toContain("出し直した");
-    expect(s.text()).toContain("version_conflict");
-    // 競合したカードは学習ステップ待ちになっているので、残りは 2 枚目だけ。
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain(order[1] as string);
-    expect(s.text()).not.toContain(order[0] as string);
+    // 1 枚目は別版で弾かれ、取り直した結果(2 枚目)が出る。
     expect(await countReviews()).toBe(1);
+    expect(s.text()).toContain("残り 1 枚");
+    expect(s.text()).toContain(b);
+    expect(s.text()).not.toContain(a);
 
-    // 取り直した version で続けられる。
     await answer(s, "Good");
+    expect(reviewBodies().at(-1)).toMatchObject({ card_id: bId, expected_version: 1 });
     expect(await countReviews()).toBe(2);
-    expect(s.text()).not.toContain("出し直した");
   });
 
   it("認証切れ(401)は再ログインを案内し、再送しない", async () => {
@@ -453,42 +390,19 @@ describe("復習画面(実 API)", () => {
     expect(byTag(s.root, "a").map((a) => a.getAttribute("href"))).toEqual(["/"]);
     expect(s.text()).toContain("再読み込みしてログインし直す");
     expect(s.ratings()).toHaveLength(0);
-    expect(s.has("同じ評価をもう一度送る")).toBe(false);
+    expect(s.has("再送")).toBe(false);
     expect(s.has("取り直す")).toBe(false);
-
-    // 401 を見た時点で止まる(取り直しも再送もしない)。
     expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
 
     // 時間が経っても、タブを往復しても、勝手に送り直さない。
-    const sent = trace().length;
     vi.advanceTimersByTime(5 * MINUTE);
     await flush();
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
-    expect(trace()).toHaveLength(sent);
+    await roundTrip(s);
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
     expect(s.text()).toContain("ログインの有効期限が切れた");
 
     expect(await countReviews()).toBe(0);
     expect(await stateOf(cardId)).toMatchObject({ version: 1 });
-  });
-
-  it("出題の取得に失敗したら理由を出し、取り直せる", async () => {
-    let offline = true;
-    connect(async (_call, send) => {
-      if (offline) throw new TypeError("Failed to fetch");
-      return await send();
-    });
-    await importOne();
-
-    const s = await openReview();
-    expect(s.text()).toContain("通信できなかった");
-    expect(s.text()).not.toContain("invoice");
-
-    offline = false;
-    await click(buttonByText(s.root, "取り直す"));
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain("invoice");
-    expect(s.text()).not.toContain("通信できなかった");
   });
 
   it("開いた時点で認証が切れていれば、取り直しもせずに再ログインを案内する", async () => {
@@ -502,35 +416,34 @@ describe("復習画面(実 API)", () => {
 
     vi.advanceTimersByTime(5 * MINUTE);
     await flush();
+    await roundTrip(s);
     expect(trace()).toEqual(["GET /api/due"]);
   });
 
-  it("送信中は評価ボタンが無効で、押し直しても二重に送らない", async () => {
-    const held = gate();
-    connect(async (call, send) => {
-      if (call.path === "/api/review") await held.wait;
+  it("出題の取得に失敗したら理由を出し、取り直せる", async () => {
+    let offline = true;
+    connect(async (_call, send) => {
+      if (offline) throw new TypeError("Failed to fetch");
       return await send();
     });
-    const cardId = await importOne();
+    await importOne();
 
     const s = await openReview();
-    await answer(s, "Good");
+    expect(s.text()).toContain("通信できなかった");
+    expect(s.text()).not.toContain("invoice");
+    expect(s.text()).not.toContain("いま出すカードは無い");
 
-    expect(s.ratings().map((b) => b.disabled)).toEqual([true, true, true, true]);
-    expect(s.text()).toContain("送信中は評価を受け付けない");
-    for (const label of RATING_LABELS) await click(buttonByText(s.root, label));
-    expect(reviewBodies()).toHaveLength(1);
-
-    held.open();
-    await flush();
-    expect(reviewBodies()).toHaveLength(1);
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+    offline = false;
+    await click(buttonByText(s.root, "取り直す"));
+    expect(s.text()).toContain("残り 1 枚");
+    expect(s.text()).toContain("invoice");
+    expect(s.text()).not.toContain("通信できなかった");
   });
 });
 
+// 短期カード(学習ステップ)。待ち時間は応答の next_due_at で出し、時間が来たら訊き直す。
 describe("復習画面(短期カード)", () => {
-  it("学習ステップの待ち時間を出し、時間が来たら同じ画面で出し直す", async () => {
+  it("学習ステップの待ち時間を出し、時間が来たらサーバーから出し直す", async () => {
     connect();
     const cardId = await importOne();
 
@@ -541,27 +454,25 @@ describe("復習画面(短期カード)", () => {
       due: toUtcIso(new Date(NOW.getTime() + MINUTE)),
     });
 
-    // 手元に残して待ち時間を出す(サーバはまだ出さない)。
-    expect(s.text()).toContain("残り 1 枚");
+    // 確定したので手元にカードは残らない。待ち時間はサーバが返した next_due_at。
+    expect((await serverDue()).cards).toEqual([]);
+    expect(s.text()).toContain("残り 0 枚");
     expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
     expect(s.has("めくる")).toBe(false);
-    expect((await serverDue()).cards).toEqual([]);
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
 
     vi.advanceTimersByTime(30 * 1000);
     await flush();
     expect(s.text()).toContain("つぎのカードまで あと 30 秒");
     expect(s.has("めくる")).toBe(false);
+    expect(trace()).toHaveLength(3); // 待っているあいだは訊きに行かない
 
-    // 1 分経ったら、取り直さずにそのまま出す。
+    // 1 分経ったら訊き直し、サーバが学習中として出した 1 枚が並ぶ。
     vi.advanceTimersByTime(30 * 1000);
     await flush();
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due", "GET /api/due"]);
     expect(s.text()).toContain("invoice");
     expect(s.has("めくる")).toBe(true);
-    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
-    // サーバ側も同じ 1 枚を学習中として出すようになっている。
-    expect((await serverDue()).cards.map((c) => [c.card_id, c.queue, c.version])).toEqual([
-      [cardId, "learning", 2],
-    ]);
 
     // 2 回目は取り直した version(2)で送る。
     await answer(s, "Good");
@@ -575,337 +486,28 @@ describe("復習画面(短期カード)", () => {
     expect(await stateOf(cardId)).toMatchObject({ version: 3 });
   });
 
-  it("めくったカードは、別のカードの期限が来ても入れ替わらない", async () => {
-    connect();
-    const ids = await importCards(["invoice", "ledger"]);
-    const order = (await serverDue()).cards.map((c) => c.front);
-    const [slow, quick] = order as [string, string];
-    const slowId = ids.get(slow) as string;
-    const quickId = ids.get(quick) as string;
-
-    // 1 枚目は Good(10 分待ち)、2 枚目は Again(1 分待ち)。待ち行列の並びは [1 枚目, 2 枚目]
-    // のままなので、期限の順(2 枚目 → 1 枚目)と一致しない。
-    const s = await openReview();
-    expect(s.text()).toContain(slow);
-    await answer(s, "Good");
-    expect(s.text()).toContain(quick);
-    await answer(s, "Again");
-    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
-
-    // 1 分後: 期限が来た 2 枚目が出る。めくる。
-    vi.advanceTimersByTime(MINUTE);
-    await flush();
-    expect(s.text()).toContain(quick);
-    await click(buttonByText(s.root, "めくる"));
-    expect(s.text()).toContain(`${quick} の意味`);
-
-    // さらに時間が経って 1 枚目の期限も来るが、めくった 2 枚目のまま
-    //(1 枚目の裏と評価ボタンが出て、2 枚目のつもりの評価が 1 枚目に入る、ということがない)。
-    vi.advanceTimersByTime(9 * MINUTE);
-    await flush();
-    expect(s.text()).toContain(`${quick} の意味`);
-    expect(s.text()).not.toContain(slow);
-    expect(s.ratings().map((b) => b.disabled)).toEqual([false, false, false, false]);
-
-    await click(buttonByText(s.root, "Good"));
-    expect(reviewBodies().at(-1)).toMatchObject({ card_id: quickId, expected_version: 2 });
-    expect(await stateOf(quickId)).toMatchObject({ version: 3 });
-    // 1 枚目は評価されていない。確定したあとに、期限の来ている 1 枚目が出る。
-    expect(await stateOf(slowId)).toMatchObject({ version: 2 });
-    expect(s.text()).toContain(slow);
-    expect(s.has("めくる")).toBe(true);
-  });
-
-  it("長い間隔のカードは手元に残さない(次に取り直したときサーバが出す)", async () => {
+  it("学習ステップを抜けたカードは、待ち時間も残らない", async () => {
     connect();
     const cardId = await importOne();
 
-    // 学習ステップを抜けて復習(日単位)に入るまで評価する。
     const s = await openReview();
     await answer(s, "Easy"); // New + Easy は 1 日以上先の復習へ
     const state = await stateOf(cardId);
     expect(state).toMatchObject({ fsrs_state: 2 });
     expect(Date.parse(String(state?.due)) - NOW.getTime()).toBeGreaterThan(60 * MINUTE);
 
+    // next_due_at は返るが 1 日以上先。画面は「無い」とだけ出し、取り直せる。
     expect(s.text()).toContain("残り 0 枚");
-    expect(s.text()).toContain("いま出すカードは無い");
-  });
-});
-
-// 取得(GET /api/due)が遅れて返ってくる状況。画面を開き直すと新しい取得が始まるので、
-// 前の取得の応答は「古い」。それで送信状態・再送キー・短期カードを巻き戻さないことを押さえる。
-describe("復習画面(取り直しの世代)", () => {
-  /** 1 回目の取得だけ、その時点の中身を持ったまま応答を遅らせる。 */
-  function delayFirstGet(): { release: () => void } {
-    const held = gate();
-    let gets = 0;
-    connect(async (call, send) => {
-      if (call.path.startsWith("/api/due") && (gets += 1) === 1) {
-        const res = await send(); // 要求はこの時点の内容で処理される
-        await held.wait; // 応答だけが遅れて届く
-        return res;
-      }
-      return await send();
-    });
-    return { release: held.open };
-  }
-
-  /** 復習タブを開いて(GET① 保留)、タブを往復して GET② を終わらせる。 */
-  async function openThenReopen() {
-    const s = await openReview();
-    expect(s.text()).toContain("読み込み中");
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
-    await flush();
-    expect(trace()).toEqual(["GET /api/due", "GET /api/due"]);
-    return s;
-  }
-
-  it("送信中に古い取得が返っても、送信状態と短期カードを失わない", async () => {
-    const held = gate();
-    const staleGet = gate();
-    let gets = 0;
-    connect(async (call, send) => {
-      if (call.path === "/api/review") {
-        await held.wait;
-        return await send();
-      }
-      if ((gets += 1) === 1) {
-        const res = await send();
-        await staleGet.wait;
-        return res;
-      }
-      return await send();
-    });
-    const cardId = await importOne();
-
-    // GET①(遅延)→ タブ往復で GET② → GET② 完了 → 評価を送信 → GET① 完了。
-    const s = await openThenReopen();
-    expect(s.text()).toContain("invoice");
-    await answer(s, "Again");
-    expect(s.ratings().map((b) => b.disabled)).toEqual([true, true, true, true]);
-
-    staleGet.open();
-    await flush();
-
-    // 古い応答は捨てる。送信中のままで、押せる評価も増えない。
-    expect(s.text()).toContain("送信中は評価を受け付けない");
-    expect(s.ratings().map((b) => b.disabled)).toEqual([true, true, true, true]);
-    expect(s.text()).toContain("残り 1 枚");
-    expect(reviewBodies()).toHaveLength(1);
-
-    // 送信が通れば、そのまま短期カードとして待ち時間つきで戻る(古い 1 枚が増えたりしない)。
-    held.open();
-    await flush();
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
-
-    vi.advanceTimersByTime(MINUTE);
-    await flush();
-    expect(s.text()).toContain("invoice");
-    expect(s.has("めくる")).toBe(true);
-  });
-
-  it("古い取得が返っても再送キーは残り、同じ review_id で確定できる", async () => {
-    const staleGet = gate();
-    let gets = 0;
-    let lost = 0;
-    connect(async (call, send) => {
-      if (call.path === "/api/review") {
-        const res = await send(); // 要求はサーバに届いている
-        if (lost < 1) {
-          lost += 1;
-          throw new TypeError("Network connection lost.");
-        }
-        return res;
-      }
-      if ((gets += 1) === 1) {
-        const res = await send();
-        await staleGet.wait;
-        return res;
-      }
-      return await send();
-    });
-    const cardId = await importOne();
-
-    const s = await openThenReopen();
-    await answer(s, "Again"); // 届いたが応答が消えた
-    expect(s.text()).toContain("通信できなかった");
-
-    staleGet.open();
-    await flush();
-
-    // 古い応答は捨てる。結果が未確定の 1 件と再送の導線がそのまま残る。
-    expect(s.text()).toContain("通信できなかった");
-    expect(s.has("同じ評価をもう一度送る")).toBe(true);
-    expect(s.text()).toContain("残り 1 枚");
-
-    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
-    const bodies = reviewBodies();
-    expect(bodies).toHaveLength(2);
-    // 再送キー(review_id と expected_version の組)が同じなので、二重評価にならない。
-    expect(bodies[1]).toEqual(bodies[0]);
-    expect(bodies[0]).toMatchObject({ expected_version: 1 });
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
-    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
-  });
-
-  it("古い取得が返っても、待っている短期カードを落とさない", async () => {
-    const stale = delayFirstGet();
-    const cardId = await importOne();
-
-    const s = await openThenReopen();
-    await answer(s, "Again"); // 1 分後へ(短期カード)
-    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
-
-    stale.release();
-    await flush();
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
-
-    // 時間が来たら、取り直さずに同じ画面で出す(version は評価後のもの)。
-    vi.advanceTimersByTime(MINUTE);
-    await flush();
-    await answer(s, "Good");
-    expect(reviewBodies().at(-1)).toMatchObject({ card_id: cardId, expected_version: 2 });
-    expect(await countReviews()).toBe(2);
-  });
-
-  it("タブを往復しても短期カードの待ちは残る", async () => {
-    connect();
-    await importOne();
-
-    const s = await openReview();
-    await answer(s, "Again");
-    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
-
-    vi.advanceTimersByTime(30 * 1000);
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
-    await flush();
-
-    // 開き直すので取り直すが、サーバがまだ出さない 1 枚は手元に残る。
-    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain("つぎのカードまで あと 30 秒");
-
-    vi.advanceTimersByTime(30 * 1000);
-    await flush();
-    expect(s.has("めくる")).toBe(true);
-  });
-
-  it("最新の取得が確定の後に返っても、評価前の版に巻き戻らない", async () => {
-    const lateGet = gate();
-    let gets = 0;
-    connect(async (call, send) => {
-      // タブ往復で始まる 2 回目の取得(= 最新の世代)だけ、評価の確定より後に返す。
-      if (call.path.startsWith("/api/due") && (gets += 1) === 2) {
-        const res = await send(); // 要求は評価前の内容で処理される
-        await lateGet.wait;
-        return res;
-      }
-      return await send();
-    });
-    const ids = await importCards(["invoice", "ledger"]);
-    const order = (await serverDue()).cards.map((c) => c.front);
-    const [a, b] = order as [string, string];
-    const aId = ids.get(a) as string;
-    const bId = ids.get(b) as string;
-
-    const s = await openReview(); // GET①
-    expect(s.text()).toContain(a);
-
-    // タブを往復して GET②(評価前の A/B を持ったまま応答が遅れる)。
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
-    await flush();
-    expect(trace()).toEqual(["GET /api/due", "GET /api/due"]);
-
-    // GET② が返る前に A を Again で確定する(1 分後へ)。
-    await answer(s, "Again");
-    expect(await stateOf(aId)).toMatchObject({ version: 2 });
-    // 確定より前に始まっていた GET② は無効にし、代わりに取り直す。
-    expect(trace()).toEqual(["GET /api/due", "GET /api/due", "POST /api/review", "GET /api/due"]);
-
-    lateGet.open();
-    await flush();
-
-    // A は確定した version 2・1 分待ちのまま(期限到来済みの version 1 に戻らない)。出ているのは B。
-    expect(s.text()).toContain("残り 2 枚");
-    expect(s.text()).toContain(b);
-    expect(s.text()).not.toContain(a);
-
-    await answer(s, "Good"); // B を評価して確定
-    expect(await stateOf(bId)).toMatchObject({ version: 2 });
     expect(s.text()).toContain("つぎのカードまで");
-
-    // 1 分後に A が戻り、確定した version で送れる(409 で出し直しにならない)。
-    vi.advanceTimersByTime(MINUTE);
-    await flush();
-    expect(s.text()).toContain(a);
-    await answer(s, "Good");
-    expect(reviewBodies().at(-1)).toMatchObject({ card_id: aId, expected_version: 2 });
-    expect(s.text()).not.toContain("出し直した");
-    expect(await countReviews()).toBe(3);
-  });
-
-  it("取得中に重ねて呼んでも GET は増えず、開き直したときだけ取り直す", async () => {
-    const stale = delayFirstGet();
-    const cardId = await importOne();
-
-    let session: Session = newSession();
-    const set: SetSession = (update) => {
-      session = update(session);
-    };
-
-    const first = loadDue(session, set); // GET①(保留)
-    const duplicated = loadDue(session, set); // 取得中なので GET は出さない
-    expect(trace()).toEqual(["GET /api/due"]);
-    expect(session.fetching).toBe(true);
-    expect(session.phase.kind).toBe("loading");
-    const generation = session.generation;
-
-    // 画面を開き直したときだけ取り直す(force)。これが最新の世代になる。
-    await reviewElsewhere(cardId, 1); // サーバ側だけ先に進める(10 分後へ)
-    await loadDue(session, set, { force: true });
-    expect(trace()).toEqual(["GET /api/due", "GET /api/due"]);
-    expect(session.generation).toBe(generation + 1); // 出さなかった分は世代を使わない
-    expect(session.queue).toEqual([]);
-    expect(session.fetching).toBe(false);
-    expect(session.phase.kind).toBe("done");
-
-    // 古い応答(カード 1 枚)は返ってきても捨てる。
-    stale.release();
-    await Promise.all([first, duplicated]);
-    expect(session.queue).toEqual([]);
-    expect(session.fetching).toBe(false);
-    expect(session.phase.kind).toBe("done");
+    expect(s.has("めくる")).toBe(false);
   });
 });
 
-// 結果が分からない 1 件(unresolved)が残っているあいだの約束を、1 つのシナリオで固定する。
-//  A: 他のカードの評価・キューの差し替え・表示カードの変更をすべて拒否する
-//  B: そのあいだに返った取得は反映せず保留し、確定してから反映する
-//  C: 確定するのは 200(冪等)か 409 だけ。通信失敗は再送で確定させる
+// 設計の差し替え(4 回目)で決めた 6 本。
 describe("復習画面(未確定の 1 件)", () => {
-  it("A を送って応答が消えたら、往復しても B に進めず、再送で確定してから B を評価できる", async () => {
-    let lost = 0;
-    connect(async (call, send) => {
-      const res = await send(); // 要求はサーバに届いている
-      if (call.path === "/api/review" && lost < 1) {
-        lost += 1;
-        throw new TypeError("Network connection lost.");
-      }
-      return res;
-    });
-    const ids = await importCards(["invoice", "ledger"]);
-    const order = (await serverDue()).cards.map((c) => c.front);
-    const [a, b] = order as [string, string];
-    const aId = ids.get(a) as string;
-    const bId = ids.get(b) as string;
+  it("1: 未確定のあいだ他の操作は無効で、再送で確定してから次へ進む", async () => {
+    losePostResponse();
+    const { a, b, aId, bId } = await twoCards();
 
     const s = await openReview();
     expect(s.text()).toContain("残り 2 枚");
@@ -913,55 +515,53 @@ describe("復習画面(未確定の 1 件)", () => {
 
     // A を Again(1 分)。届いたが応答が消えた → 結果は未確定。
     await answer(s, "Again");
-    expect(s.text()).toContain("通信できなかった");
+    expect(s.text()).toContain("送信を確認できません");
     expect(await countReviews()).toBe(1);
 
-    // タブを往復する。取得は走るが(確定済みかを見るため)、応答は反映しない。
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
-    await flush();
-    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
-    // 出ているのは A のまま。B には差し替わらない(不変条件 A・B)。
+    // タブを往復しても取得しない(= 表示中の A が B に差し替わらない)。
+    await roundTrip(s);
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
     expect(s.text()).toContain(a);
     expect(s.text()).not.toContain(b);
     expect(s.text()).toContain("残り 2 枚");
-    // B は評価できない。押せるのは A の同じ評価(= 同じ attempt の再送)だけ。
-    expect(s.ratings().map((button) => [textOf(button), button.disabled])).toEqual([
-      ["Again", false],
-      ["Hard", true],
-      ["Good", true],
-      ["Easy", true],
-    ]);
-    for (const label of ["Hard", "Good", "Easy"]) {
-      await click(buttonByText(s.root, label));
-    }
+
+    // B は評価できない。押せるのは A の再送だけ。
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+    for (const label of RATING_LABELS) await click(buttonByText(s.root, label));
     expect(reviewBodies()).toHaveLength(1);
     expect(await countReviews()).toBe(1);
     expect(await stateOf(bId)).toMatchObject({ version: 1 });
 
     // 再送(同じ review_id・同じ expected_version)で 200。サーバは 1 回目の結果を返す。
-    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
+    await click(buttonByText(s.root, "再送"));
     const bodies = reviewBodies();
     expect(bodies).toHaveLength(2);
     expect(bodies[1]).toEqual(bodies[0]);
     expect(bodies[0]).toMatchObject({ card_id: aId, rating: 1, expected_version: 1 });
-    expect(await countReviews()).toBe(1);
+    expect(await countReviews()).toBe(1); // ログは 1 行だけ
     expect(await stateOf(aId)).toMatchObject({
       version: 2,
       due: toUtcIso(new Date(NOW.getTime() + MINUTE)),
     });
 
-    // 確定したので、保留していた取得がここで入る。A は短期再出題として残り、B が出る。
-    expect(s.text()).not.toContain("通信できなかった");
-    expect(s.text()).toContain("残り 2 枚");
+    // 確定したので訊き直し、B が出る(A は 1 分後までサーバが出さない)。
+    expect(trace()).toEqual([
+      "GET /api/due",
+      "POST /api/review",
+      "POST /api/review",
+      "GET /api/due",
+    ]);
+    expect(s.text()).not.toContain("送信を確認できません");
+    expect(s.text()).toContain("残り 1 枚");
     expect(s.text()).toContain(b);
-    await answer(s, "Good");
-    expect(reviewBodies().at(-1)).toMatchObject({ card_id: bId, expected_version: 1 });
-    expect(await countReviews()).toBe(2);
-    expect(await stateOf(bId)).toMatchObject({ version: 2 });
 
-    // 1 分後、A が待ち時間つきで戻ってきて、確定した version で評価できる。
+    // B を評価すると出すものが無くなり、待ち時間は A の due になる。
+    await answer(s, "Good");
+    expect(await countReviews()).toBe(2);
+    expect(s.text()).toContain("残り 0 枚");
     expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+
+    // 1 分後に A が戻り、確定した version で評価できる。
     vi.advanceTimersByTime(MINUTE);
     await flush();
     expect(s.text()).toContain(a);
@@ -970,64 +570,179 @@ describe("復習画面(未確定の 1 件)", () => {
     expect(await countReviews()).toBe(3);
   });
 
-  it("期限を過ぎてから再送が確定しても、短期カードは消えずに出る", async () => {
-    let lost = 0;
+  it("2: 取得中は GET を重ねて出さず、遅れて返った 1 本をそのまま使う", async () => {
+    // 取得の応答だけを関門で止める(要求はその時点の内容で処理される)。
+    const gates = [gate(), gate()];
+    let gets = 0;
     connect(async (call, send) => {
-      const res = await send(); // 要求はサーバに届いている
-      if (call.path === "/api/review" && lost < 1) {
-        lost += 1;
-        throw new TypeError("Network connection lost.");
+      if (call.path.startsWith("/api/due")) {
+        const held = gates[gets];
+        gets += 1;
+        const res = await send();
+        if (held) await held.wait;
+        return res;
       }
-      return res;
+      return await send();
     });
-    const cardId = await importOne();
+    const { a, b, aId } = await twoCards();
 
+    // GET① を保留。タブを往復しても(MOUNT)、取得中なので GET は増えない。
     const s = await openReview();
-    await answer(s, "Again"); // 届いたが応答が消えた(サーバ側は 1 分後へ)
-    expect(s.text()).toContain("通信できなかった");
-
-    // タブを往復する。この取得はまだこのカードを出さない(期限は 1 分後)ので、保留される。
-    await click(buttonByText(s.root, "単票追加"));
-    await click(buttonByText(s.root, "復習"));
+    expect(s.text()).toContain("読み込み中");
+    await roundTrip(s);
+    expect(trace()).toEqual(["GET /api/due"]);
+    vi.advanceTimersByTime(5 * MINUTE);
     await flush();
-    expect((await serverDue()).cards).toEqual([]);
-    expect(s.text()).toContain("残り 1 枚");
+    expect(trace()).toEqual(["GET /api/due"]);
 
-    // 期限を過ぎてから再送して 200(冪等)。確定した due はもう過ぎている。
-    vi.advanceTimersByTime(90 * 1000);
+    // GET① が返ったら、その 1 本の結果で A を出す。
+    gates[0]?.open();
     await flush();
-    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
-    expect(reviewBodies()).toHaveLength(2);
-    expect(await countReviews()).toBe(1);
-    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+    expect(s.text()).toContain(a);
 
-    // 保留していた取得(このカードを含まない)を入れても落とさない。期限は過ぎているのでそのまま出す。
-    expect(s.text()).not.toContain("通信できなかった");
-    expect(s.text()).toContain("残り 1 枚");
-    expect(s.text()).toContain("invoice");
-    expect(s.has("めくる")).toBe(true);
-
-    // 確定した version で続けられる(消えて二度と出ない、にならない)。
+    // 評価して 200 → 確定 → GET② を発行。これも保留中は重ねない。
     await answer(s, "Good");
-    expect(reviewBodies().at(-1)).toMatchObject({ card_id: cardId, expected_version: 2 });
-    expect(await countReviews()).toBe(2);
-  });
-});
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
+    expect(await stateOf(aId)).toMatchObject({ version: 2 });
+    await roundTrip(s);
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
 
-// 不変条件 C: 確定するのは 200(冪等を含む)と 409 だけ。それ以外の応答では attempt を捨てない
-//(届いたかどうかが分からないので、次のカードへは進まない)。
-describe("復習画面(200 / 409 以外の応答)", () => {
-  it("404(カードが無い)でも attempt を保持し、別のカードには進まない", async () => {
+    gates[1]?.open();
+    await flush();
+    expect(s.text()).toContain(b);
+    expect(s.text()).not.toContain(a);
+  });
+
+  it("3: 表示中は取得しないので、サーバ側が進んでも表示は切り替わらない(409 で取り直す)", async () => {
     connect();
-    const ids = await importCards(["invoice", "ledger"]);
-    const order = (await serverDue()).cards.map((c) => c.front);
-    const [a, b] = order as [string, string];
-    const aId = ids.get(a) as string;
-    const bId = ids.get(b) as string;
+    const { a, b, aId, bId } = await twoCards();
 
     const s = await openReview();
     expect(s.text()).toContain(a);
 
+    // 別の端末が A を評価した(サーバの GET はもう A を出さず B だけを返す)。
+    await reviewElsewhere(aId, 1);
+    expect((await serverDue()).cards.map((c) => c.front)).toEqual([b]);
+
+    // タブ往復・時間の経過でも、表示中の A は B に入れ替わらない(GET も出さない)。
+    await roundTrip(s);
+    vi.advanceTimersByTime(2 * MINUTE);
+    await flush();
+    expect(trace()).toEqual(["GET /api/due"]);
+    expect(s.text()).toContain(a);
+    expect(s.text()).not.toContain(b);
+
+    // 評価すると別版で 409。確定として扱い、取り直した B を出す。
+    await answer(s, "Good");
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
+    expect(s.text()).toContain(b);
+    expect(s.text()).not.toContain(a);
+    expect(await countReviews()).toBe(1);
+
+    await answer(s, "Good");
+    expect(reviewBodies().at(-1)).toMatchObject({ card_id: bId, expected_version: 1 });
+    expect(await countReviews()).toBe(2);
+  });
+
+  it("4: 期限を過ぎてから再送が確定しても、短期カードは取りこぼさない", async () => {
+    let lose = false;
+    connect(async (call, send) => {
+      const res = await send(); // 要求はサーバに届いている
+      if (call.path === "/api/review" && lose) {
+        lose = false;
+        throw new TypeError("Network connection lost.");
+      }
+      return res;
+    });
+    const { a, b, aId, bId } = await twoCards();
+
+    const s = await openReview();
+    await answer(s, "Again"); // A は 1 分後へ
+    expect(s.text()).toContain(b);
+
+    // B の応答が消える。未確定のあいだは A の期限が来ても表示は変わらない。
+    lose = true;
+    await answer(s, "Good");
+    expect(s.text()).toContain("送信を確認できません");
+    vi.advanceTimersByTime(2 * MINUTE);
+    await flush();
+    expect(s.text()).toContain(b);
+    expect(s.text()).not.toContain(a);
+    expect(trace().filter((t) => t === "GET /api/due")).toHaveLength(2);
+
+    // 再送で 200(冪等)。確定したら訊き直し、期限の来た A が出る。
+    await click(buttonByText(s.root, "再送"));
+    expect(reviewBodies()).toHaveLength(3);
+    expect(reviewBodies()[2]).toEqual(reviewBodies()[1]);
+    expect(await countReviews()).toBe(2);
+    expect(await stateOf(bId)).toMatchObject({ version: 2 });
+    expect(s.text()).toContain(a);
+    expect(s.has("めくる")).toBe(true);
+
+    await answer(s, "Good");
+    expect(reviewBodies().at(-1)).toMatchObject({ card_id: aId, expected_version: 2 });
+    expect(await countReviews()).toBe(3);
+  });
+
+  it("5: 200 と 409 だけが確定で、404・5xx・タイムアウト・JSON 不正・401 は確定させない", async () => {
+    // 1 回目の POST だけ `fail` の中身を返す(2 回目の再送は実サーバへ通す)。
+    let fail: (() => Promise<Response>) | null = null;
+    connect(async (call, send) => {
+      if (call.path === "/api/review" && fail) {
+        const behave = fail;
+        fail = null;
+        return await behave();
+      }
+      return await send();
+    });
+    const cases: [string, () => Promise<Response>, string][] = [
+      ["5xx", async () => new Response("boom", { status: 500 }), "失敗しました(500)"],
+      [
+        "タイムアウト",
+        async () => {
+          throw new TypeError("The operation timed out.");
+        },
+        "通信できなかった",
+      ],
+      ["JSON 不正", async () => new Response("<html>", { status: 200 }), "応答を読み取れなかった"],
+    ];
+
+    for (const [name, behave, message] of cases) {
+      for (const root of mounted) unmount(root);
+      mounted = [];
+      resetSession();
+      calls = [];
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM reviews"),
+        env.DB.prepare("DELETE FROM card_state"),
+        env.DB.prepare("DELETE FROM cards"),
+        env.DB.prepare("DELETE FROM imports"),
+      ]);
+      const cardId = await importOne(name);
+
+      fail = behave;
+      const s = await openReview();
+      await answer(s, "Good");
+      expect(s.text(), name).toContain("送信を確認できません");
+      expect(s.text(), name).toContain(message);
+      expect(s.disabled(), name).toEqual(ALL_DISABLED);
+      expect(trace(), name).toEqual(["GET /api/due", "POST /api/review"]);
+
+      // 再送だけで確定する(勝手に次へ進まない)。
+      await click(buttonByText(s.root, "再送"));
+      expect(reviewBodies()[1], name).toEqual(reviewBodies()[0]);
+      expect(await countReviews(), name).toBe(1);
+      expect(await stateOf(cardId), name).toMatchObject({ version: 2 });
+      expect(s.text(), name).not.toContain("送信を確認できません");
+    }
+  });
+
+  it("5: 404(カードが無い)でも確定させず、同じ attempt の再送に任せる", async () => {
+    connect();
+    const { a, b, aId, bId } = await twoCards();
+
+    const s = await openReview();
+    expect(s.text()).toContain(a);
     // 出している 1 枚を別の経路で論理削除する(POST /api/review は 404 になる)。
     await env.DB.prepare("UPDATE cards SET deleted_at = ? WHERE id = ?")
       .bind(toUtcIso(NOW), aId)
@@ -1035,49 +750,62 @@ describe("復習画面(200 / 409 以外の応答)", () => {
 
     await answer(s, "Again");
     expect(s.text()).toContain("card_not_found");
-    expect(s.has("同じ評価をもう一度送る")).toBe(true);
-
-    // 出ているのは A のまま。B は評価できない(不変条件 A)。
     expect(s.text()).toContain(a);
     expect(s.text()).not.toContain(b);
-    expect(s.ratings().map((button) => [textOf(button), button.disabled])).toEqual([
-      ["Again", false],
-      ["Hard", true],
-      ["Good", true],
-      ["Easy", true],
-    ]);
-    for (const label of ["Hard", "Good", "Easy"]) await click(buttonByText(s.root, label));
-    expect(reviewBodies()).toHaveLength(1);
+    expect(s.disabled()).toEqual(ALL_DISABLED);
 
-    // 再送は同じ attempt のまま。勝手に取り直して B に進めたりしない。
-    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
-    const bodies = reviewBodies();
-    expect(bodies).toHaveLength(2);
-    expect(bodies[1]).toEqual(bodies[0]);
+    await click(buttonByText(s.root, "再送"));
+    expect(reviewBodies()[1]).toEqual(reviewBodies()[0]);
     expect(trace()).toEqual(["GET /api/due", "POST /api/review", "POST /api/review"]);
     expect(s.text()).toContain("card_not_found");
-    expect(s.text()).toContain(a);
     expect(await countReviews()).toBe(0);
     expect(await stateOf(bId)).toMatchObject({ version: 1 });
   });
 
-  it("400(計測が壊れた本文)でも attempt を保持し、理由を出して再送に任せる", async () => {
+  it("6: アンマウント → 再マウントでも、表示中・送信中・未確定が残る", async () => {
+    // (1) 表示中(めくった状態)
     connect();
-    const cardId = await importOne();
-
-    const s = await openReview();
-    // 端末の時計が飛んで、めくった時刻が丸 1 日以上前になった(elapsed_ms が上限を超える)。
-    vi.setSystemTime(new Date(NOW.getTime() - 25 * 60 * MINUTE));
+    await importOne();
+    let s = await openReview();
     await click(buttonByText(s.root, "めくる"));
-    vi.setSystemTime(NOW);
-    await click(buttonByText(s.root, "Good"));
+    s = await remount(s);
+    expect(s.text()).toContain("invoice の意味"); // めくったまま戻る
+    expect(trace()).toEqual(["GET /api/due"]); // 取得も増えない
+    expect(s.disabled()).toEqual(ALL_ENABLED);
 
-    expect(s.text()).toContain("invalid_elapsed_ms");
-    expect(s.has("同じ評価をもう一度送る")).toBe(true);
-    // 確定していないので、次のカードへ進めも取り直しもしない(評価が消えない)。
-    expect(s.text()).toContain("invoice");
-    expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
-    expect(await countReviews()).toBe(0);
-    expect(await stateOf(cardId)).toMatchObject({ version: 1 });
+    // (2) 送信中
+    const held = gate();
+    connect(async (call, send) => {
+      if (call.path === "/api/review") await held.wait;
+      return await send();
+    });
+    await click(buttonByText(s.root, "Good"));
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+    s = await remount(s);
+    expect(s.text()).toContain("送信中は評価を受け付けない");
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+    expect(reviewBodies()).toHaveLength(1);
+    // 画面を作り直しても、送信の結果はストアに入る。
+    held.open();
+    await flush();
+    expect(await countReviews()).toBe(1);
+    expect(s.text()).toContain("つぎのカードまで");
+
+    // (3) 未確定
+    vi.advanceTimersByTime(10 * MINUTE);
+    await flush();
+    losePostResponse();
+    await answer(s, "Good");
+    expect(s.text()).toContain("送信を確認できません");
+    s = await remount(s);
+    expect(s.text()).toContain("送信を確認できません");
+    expect(s.has("再送")).toBe(true);
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+
+    await click(buttonByText(s.root, "再送"));
+    const bodies = reviewBodies();
+    expect(bodies.at(-1)).toEqual(bodies.at(-2));
+    expect(await countReviews()).toBe(2);
+    expect(s.text()).not.toContain("送信を確認できません");
   });
 });
