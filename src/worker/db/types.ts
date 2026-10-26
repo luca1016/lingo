@@ -15,8 +15,8 @@ export interface DeckRow {
 export interface CardRow {
   id: string;
   deck_id: string;
-  term: string;
-  meaning: string;
+  front: string;
+  back: string;
   example: string | null;
   note: string | null;
   created_at: string;
@@ -35,7 +35,7 @@ export interface CardStateRow {
   learning_steps: number;
   reps: number;
   lapses: number;
-  state: number;
+  fsrs_state: number;
   last_review: string | null;
   version: number;
   updated_at: string;
@@ -48,6 +48,7 @@ export interface ReviewRow {
   rating: number;
   occurred_at: string;
   received_at: string;
+  elapsed_ms: number | null;
   state_before: string;
   state_after: string;
   review_log: string;
@@ -63,6 +64,8 @@ export interface NewReview {
   rating: number;
   occurred_at: Date;
   received_at: Date;
+  /** 解答にかかった時間(ms)。端末が測れなければ省略(= NULL)。 */
+  elapsed_ms?: number | null;
   state_before: CardStateRow;
   state_after: CardStateRow;
   review_log: ReviewLog;

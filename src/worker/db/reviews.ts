@@ -2,7 +2,7 @@ import { toUtcIso } from "../time";
 import type { NewReview, ReviewRow } from "./types";
 
 const COLUMNS =
-  "review_id, card_id, rating, occurred_at, received_at, state_before, state_after, review_log, fsrs_version, params_version, correction_of";
+  "review_id, card_id, rating, occurred_at, received_at, elapsed_ms, state_before, state_after, review_log, fsrs_version, params_version, correction_of";
 
 /**
  * 解答ログを 1 件入れる。review_id が冪等キーなので、同じ id の再送は何も変えずに false を返す
@@ -12,7 +12,7 @@ export async function insertReview(db: D1Database, review: NewReview): Promise<b
   const result = await db
     .prepare(
       `INSERT INTO reviews (${COLUMNS})
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (review_id) DO NOTHING`,
     )
     .bind(
@@ -21,6 +21,7 @@ export async function insertReview(db: D1Database, review: NewReview): Promise<b
       review.rating,
       toUtcIso(review.occurred_at),
       toUtcIso(review.received_at),
+      review.elapsed_ms ?? null,
       JSON.stringify(review.state_before),
       JSON.stringify(review.state_after),
       JSON.stringify(review.review_log),

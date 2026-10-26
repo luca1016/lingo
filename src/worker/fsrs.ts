@@ -22,7 +22,7 @@ export function toCardStateRow(
     learning_steps: card.learning_steps,
     reps: card.reps,
     lapses: card.lapses,
-    state: card.state,
+    fsrs_state: card.state,
     last_review: card.last_review ? toUtcIso(card.last_review) : null,
     version,
     updated_at: toUtcIso(updatedAt),
@@ -40,7 +40,7 @@ export function toFsrsCard(row: CardStateRow): Card {
     learning_steps: row.learning_steps,
     reps: row.reps,
     lapses: row.lapses,
-    state: fixState(row.state),
+    state: fixState(row.fsrs_state),
     last_review: row.last_review ? fromUtcIso(row.last_review) : undefined,
   };
 }

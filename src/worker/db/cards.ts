@@ -1,8 +1,7 @@
 import { DEFAULT_DECK_ID } from "./constants";
 import type { CardRow, DeckRow } from "./types";
 
-const CARD_COLUMNS =
-  "id, deck_id, term, meaning, example, note, created_at, updated_at, deleted_at";
+const CARD_COLUMNS = "id, deck_id, front, back, example, note, created_at, updated_at, deleted_at";
 
 /** カードを 1 枚取る。存在しない・論理削除済みなら null。 */
 export async function getCard(db: D1Database, id: string): Promise<CardRow | null> {

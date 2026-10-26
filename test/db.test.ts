@@ -20,6 +20,7 @@ import {
   getReview,
   getSettings,
   insertReview,
+  type NewReview,
   saveCardState,
 } from "../src/worker/db";
 import { toCardStateRow } from "../src/worker/fsrs";
@@ -49,7 +50,7 @@ beforeEach(async () => {
 /** カードの投入はまだ永続化層に無い(CSV import の Issue)ので、テストは SQL で用意する。 */
 async function seedCard(id = CARD_ID, deletedAt: string | null = null) {
   await env.DB.prepare(
-    `INSERT INTO cards (id, deck_id, term, meaning, example, note, created_at, updated_at, deleted_at)
+    `INSERT INTO cards (id, deck_id, front, back, example, note, created_at, updated_at, deleted_at)
      VALUES (?, ?, 'invoice', '請求書', 'Please send the invoice.', NULL, ?, ?, ?)`,
   )
     .bind(id, DEFAULT_DECK_ID, toUtcIso(NOW), toUtcIso(NOW), deletedAt)
@@ -68,8 +69,8 @@ describe("cards / decks", () => {
 
   it("カードを取れる", async () => {
     const card = await getCard(env.DB, CARD_ID);
-    expect(card?.term).toBe("invoice");
-    expect(card?.meaning).toBe("請求書");
+    expect(card?.front).toBe("invoice");
+    expect(card?.back).toBe("請求書");
     expect(card?.deck_id).toBe(DEFAULT_DECK_ID);
     expect(card?.deleted_at).toBeNull();
   });
@@ -133,7 +134,7 @@ describe("card_state(楽観ロック)", () => {
 describe("reviews(冪等キー)", () => {
   const REVIEW_ID = "99999999-8888-4777-8666-555555555555";
 
-  function newReview(id = REVIEW_ID, correctionOf: string | null = null) {
+  function newReview(id = REVIEW_ID, correctionOf: string | null = null): NewReview {
     const before = createEmptyCard(NOW);
     const { card, log } = fsrs(generatorParameters()).next(before, NOW, Rating.Good);
     return {
@@ -142,6 +143,7 @@ describe("reviews(冪等キー)", () => {
       rating: Rating.Good,
       occurred_at: NOW,
       received_at: new Date(NOW.getTime() + 1500),
+      elapsed_ms: 4200,
       state_before: toCardStateRow(CARD_ID, before, 0, NOW),
       state_after: toCardStateRow(CARD_ID, card, 1, NOW),
       review_log: log,
@@ -164,12 +166,19 @@ describe("reviews(冪等キー)", () => {
     expect(row?.rating).toBe(Rating.Good);
     expect(row?.occurred_at).toBe(toUtcIso(NOW));
     expect(row?.received_at).toBe(toUtcIso(new Date(NOW.getTime() + 1500)));
+    expect(row?.elapsed_ms).toBe(4200);
     expect(row?.fsrs_version).toBe(FSRSVersion);
     expect(row?.params_version).toBe(1);
     expect(row?.correction_of).toBeNull();
     expect(JSON.parse(row?.state_before ?? "null")).toEqual(review.state_before);
     expect(JSON.parse(row?.state_after ?? "null")).toEqual(review.state_after);
     expect(JSON.parse(row?.review_log ?? "null")).toMatchObject({ rating: Rating.Good });
+  });
+
+  it("elapsed_ms は省略できる(NULL で入る)", async () => {
+    const { elapsed_ms: _omitted, ...review } = newReview();
+    expect(await insertReview(env.DB, review)).toBe(true);
+    expect((await getReview(env.DB, REVIEW_ID))?.elapsed_ms).toBeNull();
   });
 
   it("同じ review_id の再送は 1 件のまま(false を返す)", async () => {

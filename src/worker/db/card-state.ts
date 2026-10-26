@@ -1,7 +1,7 @@
 import type { CardStateRow } from "./types";
 
 const COLUMNS =
-  "card_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, state, last_review, version, updated_at";
+  "card_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, fsrs_state, last_review, version, updated_at";
 
 /** カードの FSRS 状態を取る。まだ 1 度も解答していなければ null。 */
 export async function getCardState(db: D1Database, cardId: string): Promise<CardStateRow | null> {
@@ -43,7 +43,7 @@ export async function saveCardState(
         next.learning_steps,
         next.reps,
         next.lapses,
-        next.state,
+        next.fsrs_state,
         next.last_review,
         next.version,
         next.updated_at,
@@ -56,7 +56,7 @@ export async function saveCardState(
     .prepare(
       `UPDATE card_state
        SET due = ?, stability = ?, difficulty = ?, elapsed_days = ?, scheduled_days = ?,
-           learning_steps = ?, reps = ?, lapses = ?, state = ?, last_review = ?,
+           learning_steps = ?, reps = ?, lapses = ?, fsrs_state = ?, last_review = ?,
            version = ?, updated_at = ?
        WHERE card_id = ? AND version = ?`,
     )
@@ -69,7 +69,7 @@ export async function saveCardState(
       next.learning_steps,
       next.reps,
       next.lapses,
-      next.state,
+      next.fsrs_state,
       next.last_review,
       next.version,
       next.updated_at,

@@ -47,7 +47,7 @@ describe("ts-fsrs Card <-> card_state 行", () => {
     const row = toCardStateRow(CARD_ID, card, 1, NOW);
 
     expect(row.card_id).toBe(CARD_ID);
-    expect(row.state).toBe(State.New);
+    expect(row.fsrs_state).toBe(State.New);
     expect(row.last_review).toBeNull();
     expect(row.version).toBe(1);
     expect(toFsrsCard(row)).toStrictEqual(card);
@@ -80,7 +80,7 @@ describe("ts-fsrs Card <-> card_state 行", () => {
 
   it("D1 に書いて読み戻しても Card が変わらない", async () => {
     await env.DB.prepare(
-      `INSERT INTO cards (id, deck_id, term, meaning, created_at, updated_at)
+      `INSERT INTO cards (id, deck_id, front, back, created_at, updated_at)
        VALUES (?, ?, 'invoice', '請求書', ?, ?)`,
     )
       .bind(CARD_ID, DEFAULT_DECK_ID, toUtcIso(NOW), toUtcIso(NOW))
@@ -131,7 +131,7 @@ describe("時刻の往復(UTC 保存)", () => {
 
   it("D1 に書いて読み戻しても同じ文字列・同じ瞬間", async () => {
     await env.DB.prepare(
-      `INSERT INTO cards (id, deck_id, term, meaning, created_at, updated_at)
+      `INSERT INTO cards (id, deck_id, front, back, created_at, updated_at)
        VALUES (?, ?, 'invoice', '請求書', ?, ?)`,
     )
       .bind(CARD_ID, DEFAULT_DECK_ID, toUtcIso(NOW), toUtcIso(NOW))

@@ -16,8 +16,8 @@ CREATE TABLE IF NOT EXISTS decks (
 CREATE TABLE IF NOT EXISTS cards (
   id         TEXT PRIMARY KEY,                     -- UUID
   deck_id    TEXT NOT NULL REFERENCES decks (id),
-  term       TEXT NOT NULL,                        -- 単語
-  meaning    TEXT NOT NULL,                        -- 意味
+  front      TEXT NOT NULL,                        -- 表(単語)
+  back       TEXT NOT NULL,                        -- 裏(意味)
   example    TEXT,                                 -- 例文(任意)
   note       TEXT,                                 -- メモ(任意)
   created_at TEXT NOT NULL,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS card_state (
   learning_steps INTEGER NOT NULL,                 -- 学習ステップの何段目か(ts-fsrs Card.learning_steps)
   reps           INTEGER NOT NULL,
   lapses         INTEGER NOT NULL,
-  state          INTEGER NOT NULL,                 -- ts-fsrs State(0=New 1=Learning 2=Review 3=Relearning)
+  fsrs_state     INTEGER NOT NULL,                 -- ts-fsrs State(0=New 1=Learning 2=Review 3=Relearning)
   last_review    TEXT,                             -- 未解答なら NULL
   version        INTEGER NOT NULL,                 -- 楽観ロック(更新のたびに +1)
   updated_at     TEXT NOT NULL
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   rating         INTEGER NOT NULL,                 -- ts-fsrs Rating(0=Manual 1=Again 2=Hard 3=Good 4=Easy)
   occurred_at    TEXT NOT NULL,                    -- 端末で解答した時刻(UTC)
   received_at    TEXT NOT NULL,                    -- サーバが受け取った時刻(UTC)
+  elapsed_ms     INTEGER,                          -- 解答にかかった時間(ms)。測れなければ NULL
   state_before   TEXT NOT NULL,                    -- JSON: 適用前の card_state
   state_after    TEXT NOT NULL,                    -- JSON: 適用後の card_state
   review_log     TEXT NOT NULL,                    -- JSON: ts-fsrs の ReviewLog
