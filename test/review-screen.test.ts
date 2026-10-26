@@ -8,11 +8,13 @@
 //  - 認証切れ(401)は再ログインを案内し、再送ループにしない
 //  - 短期カード(学習ステップ)の待ち時間を出し、時間が来たら出し直す(固定時計)
 //  - 送信中は評価ボタンが無効
+//  - 取得の世代管理(古い応答で送信状態・再送キー・短期カードを失わない / 取得中は重ねて出さない)
 
 import { env } from "cloudflare:workers";
 import { h } from "preact";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/client/App";
+import { loadDue, newSession, type Session, type SetSession } from "../src/client/review";
 import type { ImportResponse } from "../src/shared/cards";
 import type { DueResponse } from "../src/shared/review";
 import { toUtcIso } from "../src/worker/time";
@@ -572,5 +574,201 @@ describe("復習画面(短期カード)", () => {
 
     expect(s.text()).toContain("残り 0 枚");
     expect(s.text()).toContain("いま出すカードは無い");
+  });
+});
+
+// 取得(GET /api/due)が遅れて返ってくる状況。画面を開き直すと新しい取得が始まるので、
+// 前の取得の応答は「古い」。それで送信状態・再送キー・短期カードを巻き戻さないことを押さえる。
+describe("復習画面(取り直しの世代)", () => {
+  /** 1 回目の取得だけ、その時点の中身を持ったまま応答を遅らせる。 */
+  function delayFirstGet(): { release: () => void } {
+    const held = gate();
+    let gets = 0;
+    connect(async (call, send) => {
+      if (call.path.startsWith("/api/due") && (gets += 1) === 1) {
+        const res = await send(); // 要求はこの時点の内容で処理される
+        await held.wait; // 応答だけが遅れて届く
+        return res;
+      }
+      return await send();
+    });
+    return { release: held.open };
+  }
+
+  /** 復習タブを開いて(GET① 保留)、タブを往復して GET② を終わらせる。 */
+  async function openThenReopen() {
+    const s = await openReview();
+    expect(s.text()).toContain("読み込み中");
+    await click(buttonByText(s.root, "単票追加"));
+    await click(buttonByText(s.root, "復習"));
+    await flush();
+    expect(trace()).toEqual(["GET /api/due", "GET /api/due"]);
+    return s;
+  }
+
+  it("送信中に古い取得が返っても、送信状態と短期カードを失わない", async () => {
+    const held = gate();
+    const staleGet = gate();
+    let gets = 0;
+    connect(async (call, send) => {
+      if (call.path === "/api/review") {
+        await held.wait;
+        return await send();
+      }
+      if ((gets += 1) === 1) {
+        const res = await send();
+        await staleGet.wait;
+        return res;
+      }
+      return await send();
+    });
+    const cardId = await importOne();
+
+    // GET①(遅延)→ タブ往復で GET② → GET② 完了 → 評価を送信 → GET① 完了。
+    const s = await openThenReopen();
+    expect(s.text()).toContain("invoice");
+    await answer(s, "Again");
+    expect(s.ratings().map((b) => b.disabled)).toEqual([true, true, true, true]);
+
+    staleGet.open();
+    await flush();
+
+    // 古い応答は捨てる。送信中のままで、押せる評価も増えない。
+    expect(s.text()).toContain("送信中は評価を受け付けない");
+    expect(s.ratings().map((b) => b.disabled)).toEqual([true, true, true, true]);
+    expect(s.text()).toContain("残り 1 枚");
+    expect(reviewBodies()).toHaveLength(1);
+
+    // 送信が通れば、そのまま短期カードとして待ち時間つきで戻る(古い 1 枚が増えたりしない)。
+    held.open();
+    await flush();
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+    expect(s.text()).toContain("残り 1 枚");
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+
+    vi.advanceTimersByTime(MINUTE);
+    await flush();
+    expect(s.text()).toContain("invoice");
+    expect(s.has("めくる")).toBe(true);
+  });
+
+  it("古い取得が返っても再送キーは残り、同じ review_id で確定できる", async () => {
+    const staleGet = gate();
+    let gets = 0;
+    let lost = 0;
+    connect(async (call, send) => {
+      if (call.path === "/api/review") {
+        const res = await send(); // 要求はサーバに届いている
+        if (lost < 1) {
+          lost += 1;
+          throw new TypeError("Network connection lost.");
+        }
+        return res;
+      }
+      if ((gets += 1) === 1) {
+        const res = await send();
+        await staleGet.wait;
+        return res;
+      }
+      return await send();
+    });
+    const cardId = await importOne();
+
+    const s = await openThenReopen();
+    await answer(s, "Again"); // 届いたが応答が消えた
+    expect(s.text()).toContain("通信できなかった");
+
+    staleGet.open();
+    await flush();
+
+    // 古い応答は捨てる。結果が未確定の 1 件と再送の導線がそのまま残る。
+    expect(s.text()).toContain("通信できなかった");
+    expect(s.has("同じ評価をもう一度送る")).toBe(true);
+    expect(s.text()).toContain("残り 1 枚");
+
+    await click(buttonByText(s.root, "同じ評価をもう一度送る"));
+    const bodies = reviewBodies();
+    expect(bodies).toHaveLength(2);
+    // 再送キー(review_id と expected_version の組)が同じなので、二重評価にならない。
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[0]).toMatchObject({ expected_version: 1 });
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+  });
+
+  it("古い取得が返っても、待っている短期カードを落とさない", async () => {
+    const stale = delayFirstGet();
+    const cardId = await importOne();
+
+    const s = await openThenReopen();
+    await answer(s, "Again"); // 1 分後へ(短期カード)
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+
+    stale.release();
+    await flush();
+    expect(s.text()).toContain("残り 1 枚");
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+
+    // 時間が来たら、取り直さずに同じ画面で出す(version は評価後のもの)。
+    vi.advanceTimersByTime(MINUTE);
+    await flush();
+    await answer(s, "Good");
+    expect(reviewBodies().at(-1)).toMatchObject({ card_id: cardId, expected_version: 2 });
+    expect(await countReviews()).toBe(2);
+  });
+
+  it("タブを往復しても短期カードの待ちは残る", async () => {
+    connect();
+    await importOne();
+
+    const s = await openReview();
+    await answer(s, "Again");
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+
+    vi.advanceTimersByTime(30 * 1000);
+    await click(buttonByText(s.root, "単票追加"));
+    await click(buttonByText(s.root, "復習"));
+    await flush();
+
+    // 開き直すので取り直すが、サーバがまだ出さない 1 枚は手元に残る。
+    expect(trace()).toEqual(["GET /api/due", "POST /api/review", "GET /api/due"]);
+    expect(s.text()).toContain("残り 1 枚");
+    expect(s.text()).toContain("つぎのカードまで あと 30 秒");
+
+    vi.advanceTimersByTime(30 * 1000);
+    await flush();
+    expect(s.has("めくる")).toBe(true);
+  });
+
+  it("取得中に重ねて呼んでも GET は増えず、開き直したときだけ取り直す", async () => {
+    const stale = delayFirstGet();
+    const cardId = await importOne();
+
+    let session: Session = newSession();
+    const set: SetSession = (update) => {
+      session = update(session);
+    };
+
+    const first = loadDue(session, set); // GET①(保留)
+    const duplicated = loadDue(session, set); // 取得中なので GET は出さない
+    expect(trace()).toEqual(["GET /api/due"]);
+    expect(session.loading).toBe(true);
+    const generation = session.generation;
+
+    // 画面を開き直したときだけ取り直す(force)。これが最新の世代になる。
+    await reviewElsewhere(cardId, 1); // サーバ側だけ先に進める(10 分後へ)
+    await loadDue(session, set, { force: true });
+    expect(trace()).toEqual(["GET /api/due", "GET /api/due"]);
+    expect(session.generation).toBe(generation + 1);
+    expect(session.queue).toEqual([]);
+    expect(session.loading).toBe(false);
+
+    // 古い応答(カード 1 枚)は返ってきても捨てる。
+    stale.release();
+    await Promise.all([first, duplicated]);
+    expect(session.queue).toEqual([]);
+    expect(session.loading).toBe(false);
   });
 });
