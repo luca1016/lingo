@@ -14,6 +14,15 @@ describe("区切り文字の判定", () => {
     expect(detectDelimiter('"a,b"\tc')).toBe("\t");
     expect(detectDelimiter('"a\tb",c')).toBe(",");
   });
+
+  it("カンマの数がタブより多くても、列がそろう方(TSV)を採る", () => {
+    // TSV の項目の中のカンマは引用しなくてよいので、総数で比べると CSV と誤判定する。
+    expect(detectDelimiter("front\tback\ninvoice\t請求書,送り状,インボイス,伝票")).toBe("\t");
+  });
+
+  it("項目の中にタブが紛れた CSV は CSV のまま", () => {
+    expect(detectDelimiter("front,back\ninvoice,請求\t書")).toBe(",");
+  });
 });
 
 describe("parseDelimited", () => {
@@ -106,6 +115,19 @@ describe("parseCards", () => {
       { front: "invoice", back: "請求書, 送り状", example: "Please send\nthe invoice.", note: "" },
       { front: "ledger", back: "元帳", example: "", note: "" },
     ]);
+  });
+
+  it("項目の中にカンマを複数含む TSV をヘッダごと TSV として読む", () => {
+    const result = parseCards(
+      "front\tback\ninvoice\t請求書,送り状,インボイス,伝票\nledger\t元帳,帳簿",
+    );
+    expect(result.delimiter).toBe("\t");
+    expect(result.header).toEqual(["front", "back"]);
+    expect(result.rows).toEqual([
+      { front: "invoice", back: "請求書,送り状,インボイス,伝票", example: "", note: "" },
+      { front: "ledger", back: "元帳,帳簿", example: "", note: "" },
+    ]);
+    expect(normalizeRows(result.rows).errors).toEqual([]);
   });
 
   it("空行は読み飛ばす", () => {

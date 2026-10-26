@@ -5,7 +5,7 @@
 
 import type { CardInput } from "../shared/cards";
 
-/** 区切り文字。タブがあれば TSV、無ければ CSV とみなす。 */
+/** 区切り文字。タブだけなら TSV、カンマだけなら CSV、両方あれば列の構造で決める(detectDelimiter)。 */
 export type Delimiter = "," | "\t";
 
 const BOM = "﻿";
@@ -23,8 +23,8 @@ export function stripBom(text: string): string {
   return text.startsWith(BOM) ? text.slice(1) : text;
 }
 
-/** 引用符の外にあるタブとカンマを数えて区切り文字を決める。 */
-export function detectDelimiter(text: string): Delimiter {
+/** 引用符の外に出てくる区切り文字の候補を集める。 */
+function candidates(text: string): Delimiter[] {
   let inQuotes = false;
   let tabs = 0;
   let commas = 0;
@@ -42,7 +42,49 @@ export function detectDelimiter(text: string): Delimiter {
     if (ch === "\t") tabs++;
     else if (ch === ",") commas++;
   }
-  return tabs > 0 && tabs >= commas ? "\t" : ",";
+  const found: Delimiter[] = [];
+  if (tabs > 0) found.push("\t");
+  if (commas > 0) found.push(",");
+  return found;
+}
+
+/** その区切り文字で割ったときの表の形。数が多いほど「表らしい」。 */
+interface Shape {
+  /** 2 列以上になった行の数。 */
+  multi: number;
+  /** 同じ列数(2 列以上)でそろった行の最大数。 */
+  uniform: number;
+}
+
+function shape(text: string, delimiter: Delimiter): Shape {
+  const counts = parseDelimited(text, delimiter)
+    .filter((cells) => cells.some((cell) => cell.trim() !== ""))
+    .map((cells) => cells.length);
+  const tally = new Map<number, number>();
+  for (const count of counts) {
+    if (count >= 2) tally.set(count, (tally.get(count) ?? 0) + 1);
+  }
+  return {
+    multi: counts.filter((count) => count >= 2).length,
+    uniform: Math.max(0, ...tally.values()),
+  };
+}
+
+/**
+ * 区切り文字を決める。両方が現れる場合は数で比べず、行ごとの列構造で選ぶ
+ * (TSV の項目の中のカンマは引用しなくてよいので、総数で比べると「請求書,送り状,…」のような
+ * 1 行で CSV と誤判定してしまう)。
+ */
+export function detectDelimiter(text: string): Delimiter {
+  const found = candidates(text);
+  if (found.length < 2) return found[0] ?? ",";
+
+  const tab = shape(text, "\t");
+  const comma = shape(text, ",");
+  if (tab.multi !== comma.multi) return tab.multi > comma.multi ? "\t" : ",";
+  if (tab.uniform !== comma.uniform) return tab.uniform > comma.uniform ? "\t" : ",";
+  // どちらでも同じ形になるならタブを採る(タブは項目の中にまず現れない)。
+  return "\t";
 }
 
 /**
