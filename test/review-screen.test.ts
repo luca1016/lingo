@@ -325,6 +325,7 @@ describe("復習画面(実 API)", () => {
     // 競合したカードは学習ステップ待ちになっているので、残りは 2 枚目だけ。
     expect(s.text()).toContain("残り 1 枚");
     expect(s.text()).toContain(order[1] as string);
+    expect(s.text()).not.toContain(order[0] as string);
     expect(await countReviews()).toBe(1);
 
     // 取り直した version で続けられる。
@@ -342,12 +343,12 @@ describe("復習画面(実 API)", () => {
     await answer(s, "Good");
 
     expect(s.text()).toContain("ログインの有効期限が切れた");
-    expect(s.text()).toContain("再読み込みしてログインし直す");
-    expect(s.has("再読み込み")).toBe(false);
+    // 出すのはログインし直す導線だけ。評価も再送も取り直しも押せない(= 再送ループにならない)。
     expect(byTag(s.root, "a").map((a) => a.getAttribute("href"))).toEqual(["/"]);
-    // 評価ボタンも再送ボタンも出さない(押せる再送が無い = 再送ループにならない)。
+    expect(s.text()).toContain("再読み込みしてログインし直す");
     expect(s.ratings()).toHaveLength(0);
     expect(s.has("同じ評価をもう一度送る")).toBe(false);
+    expect(s.has("取り直す")).toBe(false);
 
     // 401 を見た時点で止まる(取り直しも再送もしない)。
     expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
