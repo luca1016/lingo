@@ -16,5 +16,11 @@
     "skipLibCheck": true,
     "types": ["./worker-configuration.d.ts", "@cloudflare/vitest-plugin/types"]
   },
-  "include": ["src", "test/review-screen.test.ts", "test/dom.ts", "test/access-harness.ts"]
+  "include": [
+    "src",
+    "test/review-screen.test.ts",
+    "test/stats-screen.test.ts",
+    "test/dom.ts",
+    "test/access-harness.ts"
+  ]
 }
