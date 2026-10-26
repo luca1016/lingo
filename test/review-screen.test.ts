@@ -379,7 +379,7 @@ describe("復習画面(基本)", () => {
     expect(await countReviews()).toBe(2);
   });
 
-  it("認証切れ(401)は再ログインを案内し、再送しない", async () => {
+  it("認証切れ(401)は再ログインを案内し、勝手に送り直さない(再送は押せるまま)", async () => {
     connect();
     const cardId = await importOne();
     const s = await openReview();
@@ -388,15 +388,16 @@ describe("復習画面(基本)", () => {
     await answer(s, "Good");
 
     expect(s.text()).toContain("ログインの有効期限が切れた");
-    // 出すのはログインし直す導線だけ。評価も再送も取り直しも押せない(= 再送ループにならない)。
-    expect(byTag(s.root, "a").map((a) => a.getAttribute("href"))).toEqual(["/"]);
-    expect(s.text()).toContain("再読み込みしてログインし直す");
-    expect(s.ratings()).toHaveLength(0);
-    expect(s.has("再送")).toBe(false);
+    expect(s.text()).toContain("この評価はまだ確定していない");
+    // 再読み込みには誘わない(ストアの attempt が消えて、同じ review_id で確かめられなくなる)。
+    expect(byTag(s.root, "a")).toHaveLength(0);
+    // 押せるのはこの 1 件の再送だけ(評価は全部無効、取り直しも出さない)。
+    expect(s.disabled()).toEqual(ALL_DISABLED);
+    expect(s.has("再送")).toBe(true);
     expect(s.has("取り直す")).toBe(false);
     expect(trace()).toEqual(["GET /api/due", "POST /api/review"]);
 
-    // 時間が経っても、タブを往復しても、勝手に送り直さない。
+    // 時間が経っても、タブを往復しても、勝手に送り直さない(= 再送ループにならない)。
     vi.advanceTimersByTime(5 * MINUTE);
     await flush();
     await roundTrip(s);
@@ -405,6 +406,69 @@ describe("復習画面(基本)", () => {
 
     expect(await countReviews()).toBe(0);
     expect(await stateOf(cardId)).toMatchObject({ version: 1 });
+  });
+
+  it("認証が戻ってから再送すると、同じ本文で確定して次へ進む", async () => {
+    connect();
+    const cardId = await importOne();
+    const s = await openReview();
+
+    jwt = null;
+    await answer(s, "Again"); // 1 分後へ(確定すれば待ち時間が出る)
+    expect(s.text()).toContain("ログインの有効期限が切れた");
+    expect(await countReviews()).toBe(0);
+
+    // 別のタブでログインし直した(= 以降は Access を通る)。押すのは同じ 1 件の再送だけ。
+    jwt = harness.jwt;
+    await click(buttonByText(s.root, "再送"));
+
+    // 1 回目と同じ本文(同じ review_id・同じ expected_version)で送り、200 で確定する。
+    const bodies = reviewBodies();
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({
+      version: 2,
+      due: toUtcIso(new Date(NOW.getTime() + MINUTE)),
+    });
+
+    // 確定したので訊き直し、待ち時間の表示に戻る(再ログインの案内は消える)。
+    expect(trace()).toEqual([
+      "GET /api/due",
+      "POST /api/review",
+      "POST /api/review",
+      "GET /api/due",
+    ]);
+    expect(s.text()).not.toContain("ログインの有効期限が切れた");
+    expect(s.text()).toContain("つぎのカードまで あと 1 分 0 秒");
+  });
+
+  it("届いた評価に 401 が返っても、再送は冪等に確定する(二重評価にならない)", async () => {
+    // 要求はサーバに届いて記録されるが、応答だけが 401 になった(1 回目のみ)。
+    let expired = true;
+    connect(async (call, send) => {
+      const res = await send(); // 要求はサーバに届いている
+      if (call.path === "/api/review" && expired) {
+        expired = false;
+        return new Response(null, { status: 401 });
+      }
+      return res;
+    });
+    const cardId = await importOne();
+
+    const s = await openReview();
+    await answer(s, "Good");
+    expect(s.text()).toContain("ログインの有効期限が切れた");
+    expect(await countReviews()).toBe(1); // サーバには入っている
+
+    await click(buttonByText(s.root, "再送"));
+    const bodies = reviewBodies();
+    expect(bodies[1]).toEqual(bodies[0]);
+    // 同じ review_id なので、2 回目はログも version も増やさない(1 回目の結果が返る)。
+    expect(await countReviews()).toBe(1);
+    expect(await stateOf(cardId)).toMatchObject({ version: 2 });
+    expect(s.text()).not.toContain("ログインの有効期限が切れた");
+    expect(s.text()).toContain("つぎのカードまで");
   });
 
   it("開いた時点で認証が切れていれば、取り直しもせずに再ログインを案内する", async () => {

@@ -273,13 +273,19 @@ describe("復習の状態機械(めくる・評価)", () => {
     expect(applied.remaining).toBe(2);
   });
 
-  it("送信が認証切れなら未確定(auth)で、再送もしない", () => {
+  it("送信が認証切れなら未確定(auth)で、再送は error と同じ扱い", () => {
     const expired = reduce(sending(), {
       type: "POST_401",
       reviewId: ATTEMPT.review_id,
       message: "ログインの有効期限が切れた",
     });
     expect(expired.attempt).toMatchObject({ phase: "unresolved", reason: { kind: "auth" } });
-    ignoresAll(expired, [{ type: "RESEND" }, { type: "NEXT" }, { type: "RATE", attempt: ATTEMPT }]);
+    // 勝手に送り直さない(取得も評価も受け付けない)。動くのは人が押した RESEND だけ。
+    ignoresAll(expired, [{ type: "NEXT" }, { type: "RATE", attempt: ATTEMPT }]);
+
+    // ログインし直したあと、同じ review_id・同じ expected_version で送り直せる。
+    const resent = reduce(expired, { type: "RESEND" });
+    expect(resent.attempt).toEqual({ ...ATTEMPT, phase: "sending", reason: undefined });
+    expect(reduce(resent, { type: "POST_200", reviewId: ATTEMPT.review_id }).attempt).toBeNull();
   });
 });

@@ -8,6 +8,7 @@ import {
   canRate,
   formatWait,
   getSession,
+  isAuthBlocked,
   isLoading,
   isSending,
   needsRelogin,
@@ -62,6 +63,8 @@ export function Review() {
     if (session.waitUntil !== null && Date.parse(session.waitUntil) <= now) void next();
   }, [now, session.waitUntil]);
 
+  // 取得が認証切れで、送り直すものも無いとき。ここは再読み込みで入り直してもらうしかない
+  //(未確定の送信があるときは下の案内に出す。再読み込みに誘うと attempt が消える)。
   if (needsRelogin(session)) {
     return (
       <section>
@@ -76,6 +79,7 @@ export function Review() {
 
   const current = session.current;
   const held = unresolved(session);
+  const authBlocked = isAuthBlocked(held);
   const waitUntil = session.waitUntil === null ? null : Date.parse(session.waitUntil);
 
   return (
@@ -136,10 +140,21 @@ export function Review() {
         </>
       )}
 
-      {/* 結果が分からない 1 件。できるのは同じ本文の再送だけ(次のカードには進まない)。 */}
+      {/* 結果が分からない 1 件。できるのは同じ本文の再送だけ(次のカードには進まない)。
+          認証切れも同じ扱い: 再ログインを案内しつつ、再送ボタンは有効のままにする。 */}
       {held ? (
         <section>
-          <p style={ng}>送信を確認できません — {held.reason?.message}</p>
+          {authBlocked ? (
+            <>
+              <p style={ng}>ログインの有効期限が切れた — この評価はまだ確定していない。</p>
+              <p style={sub}>
+                別のタブで lingo を開いてログインし直してから「再送」を押す(同じ評価なので二重に
+                は記録されない)。この画面を再読み込みすると、再送に使う印が消える。
+              </p>
+            </>
+          ) : (
+            <p style={ng}>送信を確認できません — {held.reason?.message}</p>
+          )}
           <button type="button" style={button} onClick={() => void resend()}>
             再送
           </button>

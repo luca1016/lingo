@@ -21,6 +21,7 @@
 //   attempt.sending            │ POST_401          │ unresolved(auth)。再ログイン表示
 //   attempt.sending            │ それ以外すべて      │ unresolved(error)。再送の導線を出す
 //   attempt.unresolved         │ RESEND            │ 同じ review_id / expected_version で POST
+//                              │                   │(auth / error のどちらでも同じ扱い)
 //   attempt≠null               │ RATE / NEXT / タイマー / タブ復帰 │ 無視
 //   current≠null               │ タイマー(waitUntil)│ 無視(表示中のカードは切り替えない)
 
@@ -187,8 +188,9 @@ export function reduce(session: Session, event: Event): Session {
     case "RESEND": {
       const attempt = session.attempt;
       if (!attempt || attempt.phase !== "unresolved") return session;
-      // 認証切れは再ログインするまで何を送っても通らないので、再送しない(再送ループを作らない)。
-      if (attempt.reason?.kind === "auth") return session;
+      // 理由(auth / error)で分けない。認証切れでも、別のタブでログインし直したあとに
+      // 同じ review_id・同じ expected_version で送り直せる必要がある(再送は人が押すので
+      // ループにはならない)。画面を再読み込みさせて attempt を捨てさせないため。
       return { ...session, attempt: { ...attempt, phase: "sending", reason: undefined } };
     }
     case "POST_200":
@@ -202,6 +204,8 @@ export function reduce(session: Session, event: Event): Session {
         revealedAt: null,
         waitUntil: null,
         fetchError: null,
+        // 受理されたなら認証は戻っている(取得の 401 で立てた印を下ろし、NEXT を通す)。
+        authExpired: false,
       };
     }
     case "POST_401": {
@@ -358,9 +362,20 @@ export function unresolved(session: Session): Attempt | null {
   return attempt && attempt.phase === "unresolved" ? attempt : null;
 }
 
-/** 再ログインが必要か(取得が 401 / 送信が 401)。 */
+/**
+ * 取得が認証切れで、未確定の送信も無い。送り直すものが無いので、再読み込みしてログインし直す
+ *(ここで再読み込みに誘っても失われる attempt は無い)。
+ */
 export function needsRelogin(session: Session): boolean {
-  return session.authExpired || session.attempt?.reason?.kind === "auth";
+  return session.authExpired && session.attempt === null;
+}
+
+/**
+ * 未確定の 1 件が認証切れで止まっている。再ログインの案内を出すが、再送ボタンは有効のまま
+ *(この画面を再読み込みすると attempt が消えて、同じ review_id で確かめられなくなる)。
+ */
+export function isAuthBlocked(attempt: Attempt | null): boolean {
+  return attempt?.reason?.kind === "auth";
 }
 
 /** 最初の 1 枚を待っている(出すものが無いまま取得中)。 */
