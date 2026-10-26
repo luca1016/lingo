@@ -2,7 +2,7 @@
 export { getCardState, saveCardState, updateCardStateStatement } from "./card-state";
 export { getCard, getCardIncludingDeleted, getDeck } from "./cards";
 export { DEFAULT_DECK_ID, SETTINGS_ID } from "./constants";
-export { countNewStartedBetween, type DueCardRow, listDueCards } from "./due";
+export { countNewStartedBetween, type DueCardRow, listDueCards, nextDueAt } from "./due";
 export { findCardIdsByFront, getImport, insertImport } from "./imports";
 export { commitReview, getReview, insertReview } from "./reviews";
 export { getSettings } from "./settings";
