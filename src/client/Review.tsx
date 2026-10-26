@@ -1,20 +1,23 @@
 // 復習画面(スマホ 1 カラム)。残り枚数 → 表 → めくる → Again / Hard / Good / Easy。
-// 状態遷移と通信は review.ts / review-api.ts に置き、ここは見た目と押下の受け渡しだけ。
+// 状態遷移は review.ts の状態機械(reduce)、通信は review-api.ts。ここは見た目と押下の受け渡しだけ。
 
 import { useEffect, useState } from "preact/hooks";
 import { RATINGS, type ReviewRating } from "../shared/review";
 import {
+  canRate,
   currentCard,
   formatWait,
   isRevealed,
+  isSendingNow,
   loadDue,
   nextDueAt,
   rate,
+  reduce,
   remaining,
   resend,
-  reveal,
   type Session,
   type SetSession,
+  unresolved,
 } from "./review";
 
 const button = { padding: "10px 16px", marginTop: "12px", fontSize: "16px" };
@@ -42,12 +45,15 @@ export function Review({ session, setSession }: { session: Session; setSession: 
     return () => clearInterval(id);
   }, []);
 
-  // 画面を開いたら出題を取り直す(タブを往復しても、待っている短期カードは手元に残る)。
-  // 送信中なら取り直さない(その応答で決まる)。結果が分からないまま離れていた場合も、送った
-  // 1 件は残してあるので、ここで取り直したあと同じ review_id で結果を確定できる(loadDue)。
-  //
-  // 離れている間にサーバ側が変わっているので、前の画面の取得が進行中でも取り直す(force)。
-  // 古いほうの応答は世代が合わなくなるので、後から返ってきても画面には入らない。
+  // 期限が来た短期カードを出す。出している 1 枚・送っている 1 件には触らない(不変条件 B)。
+  useEffect(() => {
+    setSession((prev) => reduce(prev, { type: "tick", now: now.getTime() }));
+  }, [now]);
+
+  // 画面を開いたら出題を取り直す(離れている間にサーバ側が変わっている)。
+  // 送信中は取りに行かないし、未確定の 1 件があるときは応答を保留するだけなので、
+  // タブを往復しても送信状態・再送キー・短期カードは失われない(不変条件 A・B)。
+  // 前の画面の取得が進行中でも取り直す(force)。古いほうの応答は世代が合わず捨てられる。
   useEffect(() => {
     void loadDue(session, setSession, { force: true });
   }, []);
@@ -64,15 +70,16 @@ export function Review({ session, setSession }: { session: Session; setSession: 
     );
   }
 
-  const card = currentCard(session, now);
+  const phase = session.phase;
+  const card = currentCard(session);
+  const held = unresolved(session);
   const waitUntil = nextDueAt(session, now);
-  const left = remaining(session);
 
   return (
     <section>
       <h2>復習</h2>
       <p>
-        残り {left} 枚
+        残り {remaining(session)} 枚
         {session.newRemaining !== null ? ` / 今日の新規はあと ${session.newRemaining} 枚` : ""}
       </p>
       {session.notice ? <p style={warn}>{session.notice}</p> : null}
@@ -80,8 +87,8 @@ export function Review({ session, setSession }: { session: Session; setSession: 
       {card ? (
         <article>
           <p style={front}>{card.front}</p>
-          {/* 裏と評価ボタンは、めくったカード自身にだけ付ける(別のカードには付け替わらない)。 */}
-          {isRevealed(session, card) ? (
+          {/* 裏と評価ボタンは、出している 1 枚にだけ付く(別のカードには付け替わらない)。 */}
+          {isRevealed(session) ? (
             <>
               <p style={back}>{card.back}</p>
               {card.example ? <p style={sub}>{card.example}</p> : null}
@@ -92,62 +99,66 @@ export function Review({ session, setSession }: { session: Session; setSession: 
                     key={rating}
                     type="button"
                     style={rateButton}
-                    disabled={session.sending || session.loading}
+                    disabled={!canRate(session, rating)}
                     onClick={() => void rate(session, card, rating, setSession, new Date())}
                   >
                     {RATING_LABELS[rating]}
                   </button>
                 ))}
               </div>
-              {session.sending ? <p style={sub}>送信中は評価を受け付けない</p> : null}
+              {isSendingNow(session) ? <p style={sub}>送信中は評価を受け付けない</p> : null}
+              {held ? (
+                <p style={sub}>
+                  結果が分かるまで次のカードには進まない(同じ評価を送り直して確かめる)
+                </p>
+              ) : null}
             </>
           ) : (
             <button
               type="button"
               style={button}
-              disabled={session.sending}
-              onClick={() => setSession((prev) => reveal(prev, card))}
+              onClick={() =>
+                setSession((prev) =>
+                  reduce(prev, { type: "reveal", cardId: card.cardId, now: Date.now() }),
+                )
+              }
             >
               めくる
             </button>
           )}
         </article>
-      ) : session.loading ? (
+      ) : phase.kind === "loading" ? (
         <p>読み込み中…</p>
       ) : waitUntil ? (
         <p>つぎのカードまで あと {formatWait(waitUntil.getTime() - now.getTime())}</p>
-      ) : session.failure ? // 取れなかっただけなので「無い」とは言わない(理由と取り直しは下の節で出す)。
-      null : (
+      ) : phase.kind === "done" ? (
         <>
           <p>いま出すカードは無い</p>
           <button type="button" style={button} onClick={() => void loadDue(session, setSession)}>
             取り直す
           </button>
         </>
-      )}
+      ) : // 取れなかっただけなので「無い」とは言わない(理由と取り直しは下の節で出す)。
+      null}
 
-      {session.failure ? (
+      {held ? (
+        <section>
+          <p style={ng}>{held.reason}</p>
+          <button type="button" style={button} onClick={() => void resend(session, setSession)}>
+            同じ評価をもう一度送る
+          </button>
+        </section>
+      ) : session.failure ? (
         <section>
           <p style={ng}>{session.failure}</p>
-          {session.attempt ? (
-            <button
-              type="button"
-              style={button}
-              disabled={session.sending || session.loading}
-              onClick={() => void resend(session, setSession)}
-            >
-              同じ評価をもう一度送る
-            </button>
-          ) : (
-            <button
-              type="button"
-              style={button}
-              disabled={session.loading}
-              onClick={() => void loadDue(session, setSession)}
-            >
-              取り直す
-            </button>
-          )}
+          <button
+            type="button"
+            style={button}
+            disabled={session.fetching}
+            onClick={() => void loadDue(session, setSession)}
+          >
+            取り直す
+          </button>
         </section>
       ) : null}
     </section>

@@ -1,20 +1,36 @@
-// 復習画面の状態と遷移(画面の見た目は Review.tsx、通信は review-api.ts)。
+// 復習画面の状態機械(見た目は Review.tsx、通信は review-api.ts)。
 //
-// 守りたいこと:
-//  - 冪等キー(review_id)は「このカード・この評価・この version」に対してだけ有効。
-//    同じものを押し直した再送は同じ review_id で送り(二重評価にならない)、
-//    別の評価に変えたら新しい review_id にする(サーバが前回の結果を返して誤解させないため)。
-//  - 送信中は何も受け付けない(ボタンは disabled。サーバ側冪等性の補助)。
-//  - 409(version_conflict)は端末の持っている version が古いだけなので、due を取り直して続ける。
-//  - 認証切れ(401)はログインし直すまで何を送っても通らないので、再送をやめて案内だけ出す。
-//  - 短期カード(学習ステップ)は due を手元に持ち、時間が来たら同じ画面で出し直す。
-//  - 出しているカードは勝手に入れ替えない。めくった 1 枚は card_id を持って固定し(revealed)、
-//    待ち行列の別のカードの期限が来ても、裏と評価ボタンがそのカードに付け替わらない。
-//  - 取得(GET /api/due)には世代番号を付け、応答が返った時点で最新世代でなければ結果を捨てる。
-//    画面の状態は「いまの状態(prev)」から作り直す(更新関数で渡す)ので、遅れて返ってきた取得が
-//    送信状態・再送キー・短期カードを巻き戻すことがない。
+// 画面の状態は 1 つの reducer(`reduce`)だけが動かす。状態は次の 6 つで、どの action を
+// 受け付けるかはその状態だけで決まる(個別の経路を塞ぐのではなく、形で守る)。
+//
+//   idle       … 出せるカードが無い(短期カードの待ち)。期限が来たら showing に入る
+//   loading    … 出すものが無いまま取得を待っている
+//   showing    … 1 枚を出している(めくる前・めくった後)。card_id で固定する
+//   sending    … 評価 1 件(attempt)を送っている
+//   unresolved … 送ったが結果が分からない。同じ attempt の再送でしか抜けられない
+//   done       … 出すカードが無い(待ちも無い)
+//
+// attempt = review_id / card_id / expected_version / rating の組(= 冪等キーと前提)。
+// 再送は同じ attempt をそのまま送るので、サーバには 1 回分しか入らない。
+//
+// 不変条件:
+//  A. sending / unresolved の間は、他のカードの評価・待ち行列の差し替え・表示カードの変更を
+//     すべて拒否する。できるのは「同じ attempt の再送」と「取得で確定済みか見ること」だけ。
+//  B. 取得(GET /api/due)の応答は sending / unresolved 中は反映せず `pending` に保留し、
+//     attempt が確定してから反映する。出している 1 枚は、期限の到来や新しい due の出現では
+//     入れ替わらない(入れ替わるのは評価が確定したときだけ)。
+//  C. attempt の確定は「200(成功または冪等)」か「409 / 404(別版・消失 → 取り直して出し直す)」
+//     だけ。通信失敗は unresolved に移り、ユーザーの操作で再送する。
+//
+// 取得には世代番号(`generation`)を付ける。応答が返った時点で最新世代でなければ捨てる。
+// 世代は状態が持つので、タブを往復して画面が作り直されても続く。
 
-import { type DueCard, queueOfFsrsState, type ReviewRating } from "../shared/review";
+import {
+  type DueCard,
+  queueOfFsrsState,
+  type ReviewRating,
+  type ReviewState,
+} from "../shared/review";
 import {
   getDue,
   newReviewId,
@@ -48,69 +64,81 @@ export interface QueuedCard {
   due: string;
 }
 
-/**
- * めくった 1 枚。どのカードをめくったのか(card_id)と、いつめくったのかを組で持つ。
- * 表示・評価の対象はこのカードに固定される(時間が経って別のカードの期限が来ても動かない)。
- */
-export interface Revealed {
-  cardId: string;
-  /** めくった時刻(ms)。評価までの時間を elapsed_ms に入れる。 */
-  at: number;
+/** 画面の状態(状態機械の状態)。 */
+export type Phase =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  /** 出している 1 枚。`revealedAt` が null ならまだ表だけ。 */
+  | { kind: "showing"; cardId: string; revealedAt: number | null }
+  | { kind: "sending"; attempt: ReviewAttempt }
+  | { kind: "unresolved"; attempt: ReviewAttempt; reason: string }
+  | { kind: "done" };
+
+/** sending / unresolved 中に返ってきた取得。attempt が確定してから反映する(不変条件 B)。 */
+export interface PendingDue {
+  cards: DueCard[];
+  newRemaining: number;
 }
 
 export interface Session {
+  /** いまの状態。これだけで受け付ける操作が決まる。 */
+  phase: Phase;
   /** 残っているカード(この中から 1 枚出す)。 */
   queue: QueuedCard[];
-  /** 裏までめくった 1 枚(めくっていなければ null)。 */
-  revealed: Revealed | null;
-  /** 送信中。 */
-  sending: boolean;
-  /** 送った(送ろうとした)1 件。失敗しても残すので同じ review_id で再送できる。 */
-  attempt: ReviewAttempt | null;
-  /** 再送できる失敗の説明。 */
-  failure: string | null;
-  /** 認証切れ。立ったら送信も取得もしない。 */
+  /** 取得(GET /api/due)が進行中か。重ねて出さないための印。 */
+  fetching: boolean;
+  /** 取得の世代(直近に始めた取得の番号。0 = まだ取得していない)。 */
+  generation: number;
+  /** 保留している取得の応答。 */
+  pending: PendingDue | null;
+  /** 認証切れ。立ったら以後どの action も受け付けない(再送ループを作らない)。 */
   authExpired: boolean;
-  /** GET /api/due 中。 */
-  loading: boolean;
+  /** 取得の失敗(取り直せる)。 */
+  failure: string | null;
   /** 出し直したときなどの案内(失敗ではない)。 */
   notice: string | null;
   /** その日あと何枚の新規を出せるか(未取得なら null)。 */
   newRemaining: number | null;
-  /**
-   * いまの状態を作った取得の世代(`loadDue` のたびに 1 つ進む。0 = まだ取得していない)。
-   * 応答が返った時点でこれが自分の世代でなければ、新しい取得が始まっているので結果は捨てる。
-   */
-  generation: number;
 }
+
+/** 状態機械に流す出来事。 */
+export type Action =
+  /** 取得を始める(`force` = 画面を開き直したので進行中でも取り直す)。 */
+  | { type: "load_started"; force: boolean; notice: string | null }
+  | {
+      type: "load_succeeded";
+      generation: number;
+      cards: readonly DueCard[];
+      newRemaining: number;
+      now: number;
+    }
+  | { type: "load_failed"; generation: number; failure: string }
+  /** 認証切れ。取得由来なら世代を付ける(古い応答では落とさない)。 */
+  | { type: "auth_expired"; generation: number | null }
+  | { type: "reveal"; cardId: string; now: number }
+  | { type: "send_started"; attempt: ReviewAttempt }
+  | { type: "send_resolved"; attempt: ReviewAttempt; state: ReviewState; now: number }
+  | { type: "send_conflicted"; attempt: ReviewAttempt }
+  | { type: "send_unresolved"; attempt: ReviewAttempt; reason: string }
+  /** 時計が進んだ(期限の来た短期カードを出す)。 */
+  | { type: "tick"; now: number };
 
 /** 画面の状態を更新する(いまの状態から次を作る。古い値を抱えたまま上書きしないため)。 */
 export type SetSession = (update: (prev: Session) => Session) => void;
 
 export function newSession(): Session {
   return {
+    // 開いた直後に「いま出すカードは無い」と出さないため、最初の取得を待つ状態で始める。
+    phase: { kind: "loading" },
     queue: [],
-    revealed: null,
-    sending: false,
-    attempt: null,
-    failure: null,
+    fetching: false,
+    generation: 0,
+    pending: null,
     authExpired: false,
-    loading: false,
+    failure: null,
     notice: null,
     newRemaining: null,
-    generation: 0,
   };
-}
-
-/**
- * 取得に付ける世代番号を作る(単調増加。同じ番号は二度出ない)。
- * 画面を作り直しても(タブの往復で Review が再マウントされても)番号は続くので、
- * 前の画面が出した取得の応答が後から返っても「古い」と分かる。
- */
-let lastGeneration = 0;
-function nextGeneration(): number {
-  lastGeneration += 1;
-  return lastGeneration;
 }
 
 function toQueued(card: DueCard): QueuedCard {
@@ -128,58 +156,296 @@ function toQueued(card: DueCard): QueuedCard {
 /**
  * 取り直した due と手元の待ち行列を合わせる。
  * サーバが出したものを正とし、手元にしかない「まだ期限が来ていない短期カード」だけ後ろに残す
- * (409 で出し直したときに、待っている短期カードの待ち時間表示を失わないため)。
- *
- * `pendingCardId` は結果が未確定の 1 枚(送ったが応答が消えた)。期限を過ぎていても外さない:
- * 評価が届いていた場合、サーバはもう期限前のカードとして出さないので、ここで落とすと同じ
- * review_id での再送先も待ち時間表示も失う。結果を確定してから `advance` が片付ける。
+ * (取り直したときに、待っている短期カードの待ち時間表示を失わないため)。
  */
 export function mergeQueue(
   previous: readonly QueuedCard[],
   cards: readonly DueCard[],
-  now: Date,
-  pendingCardId: string | null = null,
+  now: number,
 ): QueuedCard[] {
   const fromServer = cards.map(toQueued);
   const ids = new Set(fromServer.map((q) => q.cardId));
-  const waiting = previous.filter(
-    (q) => !ids.has(q.cardId) && (q.cardId === pendingCardId || Date.parse(q.due) > now.getTime()),
-  );
+  const waiting = previous.filter((q) => !ids.has(q.cardId) && Date.parse(q.due) > now);
   return [...fromServer, ...waiting];
 }
 
-/**
- * いま出すカード。無ければ null。
- *
- * めくった 1 枚は、評価が確定する(または取り直しでめくり状態が消える)まで出し続ける。
- * めくっていないときは、期限が来ているもののうち期限がいちばん早い 1 枚を出す。
- * こうしておくと、時間が経って別のカードの期限が来ても出しているカードは変わらない
- *(あとから期限が来るカードの due は、いま出している 1 枚の due より必ず後ろなので)。
- * 待ち行列の並び順(= サーバが出した順 + 手元の短期カード)と期限の順は一致しないので、
- * 「先頭から最初に期限が来ている 1 枚」だと、別のカードに勝手に入れ替わることがある。
- */
-export function currentCard(session: Session, now: Date): QueuedCard | null {
-  const pinned = session.revealed
-    ? session.queue.find((q) => q.cardId === session.revealed?.cardId)
-    : undefined;
-  if (pinned) return pinned;
+/** 期限が来ているもののうち、期限がいちばん早い 1 枚(無ければ null)。 */
+function earliestDue(queue: readonly QueuedCard[], now: number): QueuedCard | null {
   let earliest: QueuedCard | null = null;
-  for (const q of session.queue) {
+  for (const q of queue) {
     const due = Date.parse(q.due);
-    if (due > now.getTime()) continue;
+    if (due > now) continue;
     if (earliest === null || due < Date.parse(earliest.due)) earliest = q;
   }
   return earliest;
 }
 
-/** その 1 枚の裏を出しているか(裏と評価ボタンは、めくったカードにだけ付ける)。 */
-export function isRevealed(session: Session, card: QueuedCard): boolean {
-  return session.revealed?.cardId === card.cardId;
+/**
+ * 待ち行列から次の状態を決める(評価が確定したとき・取り直したときだけ呼ぶ)。
+ * 期限が来ている 1 枚を出し、無ければ待ち(idle)、待ちも無ければ終わり(done)。
+ */
+function settle(queue: readonly QueuedCard[], now: number): Phase {
+  if (queue.length === 0) return { kind: "done" };
+  const next = earliestDue(queue, now);
+  return next ? { kind: "showing", cardId: next.cardId, revealedAt: null } : { kind: "idle" };
+}
+
+/** attempt の結果を待っているか(= 他の操作をすべて拒否する。不変条件 A)。 */
+function awaitingAttempt(phase: Phase): boolean {
+  return phase.kind === "sending" || phase.kind === "unresolved";
+}
+
+/** その action が指す attempt が、いま送っている 1 件か。 */
+function isSending(phase: Phase, attempt: ReviewAttempt): boolean {
+  return phase.kind === "sending" && phase.attempt.reviewId === attempt.reviewId;
+}
+
+/**
+ * 状態機械。拒否する action では同じ参照をそのまま返す(呼び出し側が受理されたか分かる)。
+ */
+export function reduce(session: Session, action: Action): Session {
+  // 認証切れのあとは何も動かさない(送信も取得も再送もしない)。
+  if (session.authExpired) return session;
+
+  switch (action.type) {
+    case "load_started":
+      return startLoad(session, action.force, action.notice);
+    case "load_succeeded":
+      return applyDue(session, action);
+    case "load_failed":
+      return failLoad(session, action.generation, action.failure);
+    case "auth_expired":
+      if (action.generation !== null && action.generation !== session.generation) return session;
+      return {
+        ...session,
+        authExpired: true,
+        fetching: false,
+        pending: null,
+        phase: { kind: "idle" },
+        failure: null,
+        notice: null,
+      };
+    case "reveal":
+      return revealCard(session, action.cardId, action.now);
+    case "send_started":
+      return startSend(session, action.attempt);
+    case "send_resolved":
+      return resolveSend(session, action);
+    case "send_conflicted":
+      return conflictSend(session, action.attempt);
+    case "send_unresolved":
+      if (!isSending(session.phase, action.attempt)) return session;
+      return {
+        ...session,
+        phase: { kind: "unresolved", attempt: action.attempt, reason: action.reason },
+      };
+    case "tick":
+      return tick(session, action.now);
+  }
+}
+
+/**
+ * 取得を始める。
+ * - 送信中は取りに行かない(結果は POST の応答で決まる)。
+ * - 取得中に重ねて呼ばれても GET は増やさない。画面を開き直したときだけ取り直す(`force`)。
+ *   そのとき進行中だった取得は世代が合わなくなるので、応答が返っても捨てられる。
+ * - 出している 1 枚と未確定の 1 件は取得で消さない(不変条件 A・B)。
+ */
+function startLoad(session: Session, force: boolean, notice: string | null): Session {
+  if (session.phase.kind === "sending") return session;
+  if (session.fetching && !force) return session;
+  const keep = session.phase.kind === "showing" || session.phase.kind === "unresolved";
+  return {
+    ...session,
+    phase: keep ? session.phase : { kind: "loading" },
+    fetching: true,
+    generation: session.generation + 1,
+    failure: null,
+    notice,
+  };
+}
+
+/** 取り直した結果を反映する(送信中・未確定なら保留する)。 */
+function applyDue(
+  session: Session,
+  action: { generation: number; cards: readonly DueCard[]; newRemaining: number; now: number },
+): Session {
+  // 自分より後に始まった取得があれば、この応答は古い。何も書かない。
+  if (action.generation !== session.generation) return session;
+  if (awaitingAttempt(session.phase)) {
+    // 不変条件 B: 捨てずに保留し、attempt が確定してから反映する。
+    return {
+      ...session,
+      fetching: false,
+      pending: { cards: [...action.cards], newRemaining: action.newRemaining },
+    };
+  }
+  const queue = mergeQueue(session.queue, action.cards, action.now);
+  return {
+    ...session,
+    fetching: false,
+    failure: null,
+    queue,
+    newRemaining: action.newRemaining,
+    // 出している 1 枚が残っていればそのまま出し続ける(不変条件 B)。
+    phase: keepShowing(session.phase, queue) ?? settle(queue, action.now),
+  };
+}
+
+function keepShowing(phase: Phase, queue: readonly QueuedCard[]): Phase | null {
+  if (phase.kind !== "showing") return null;
+  return queue.some((q) => q.cardId === phase.cardId) ? phase : null;
+}
+
+function failLoad(session: Session, generation: number, failure: string): Session {
+  if (generation !== session.generation) return session;
+  // 送信中・未確定のときの取得は「確定済みか見る」ためのものなので、失敗しても画面は変えない。
+  if (awaitingAttempt(session.phase)) return { ...session, fetching: false };
+  return {
+    ...session,
+    fetching: false,
+    failure,
+    // 取れなかっただけなので「出すカードは無い」とは言わない(理由と取り直しを出す)。
+    phase: session.phase.kind === "loading" ? { kind: "idle" } : session.phase,
+  };
+}
+
+/** 出している 1 枚の裏をめくる(そのカードを出していないときは何もしない)。 */
+function revealCard(session: Session, cardId: string, now: number): Session {
+  const phase = session.phase;
+  if (phase.kind !== "showing" || phase.cardId !== cardId || phase.revealedAt !== null) {
+    return session;
+  }
+  if (!session.queue.some((q) => q.cardId === cardId)) return session;
+  return { ...session, phase: { ...phase, revealedAt: now } };
+}
+
+/**
+ * 評価 1 件を送り始める。
+ * 未確定の 1 件があるあいだは、同じ attempt の再送だけ受け付ける(不変条件 A)。
+ * それ以外は「めくって出している 1 枚」で、手元の version のままのときだけ送れる。
+ */
+function startSend(session: Session, attempt: ReviewAttempt): Session {
+  const phase = session.phase;
+  if (phase.kind === "unresolved") {
+    if (phase.attempt.reviewId !== attempt.reviewId) return session;
+    return { ...session, phase: { kind: "sending", attempt: phase.attempt } };
+  }
+  if (phase.kind !== "showing" || phase.revealedAt === null) return session;
+  if (phase.cardId !== attempt.cardId) return session;
+  const sendable = session.queue.some(
+    (q) => q.cardId === attempt.cardId && q.version === attempt.expectedVersion,
+  );
+  if (!sendable) return session;
+  return { ...session, phase: { kind: "sending", attempt }, failure: null, notice: null };
+}
+
+/**
+ * 200(成功または冪等)で確定した。評価した 1 枚を待ち行列から外し、
+ * 短期カード(学習ステップ)なら待ち時間つきで戻す。保留していた取得はここで反映する。
+ */
+function resolveSend(
+  session: Session,
+  action: { attempt: ReviewAttempt; state: ReviewState; now: number },
+): Session {
+  if (!isSending(session.phase, action.attempt)) return session;
+  const cardId = action.attempt.cardId;
+  const reviewed = session.queue.find((q) => q.cardId === cardId);
+  const rest = session.queue.filter((q) => q.cardId !== cardId);
+  const shortTerm =
+    queueOfFsrsState(action.state.fsrs_state) === "learning" &&
+    Date.parse(action.state.due) - action.now <= SHORT_TERM_WAIT_MAX_MS;
+  const advanced =
+    reviewed && shortTerm
+      ? [...rest, { ...reviewed, version: action.state.version, due: action.state.due }]
+      : rest;
+  // 保留していた応答は、この確定より前にサーバが見た内容。評価した 1 枚については
+  // いま確定した version / due のほうが新しいので、サーバ側の古い 1 枚は入れない。
+  const pending = session.pending;
+  const queue = pending
+    ? mergeQueue(
+        advanced,
+        pending.cards.filter((c) => c.card_id !== cardId),
+        action.now,
+      )
+    : advanced;
+  return {
+    ...session,
+    queue,
+    pending: null,
+    newRemaining: pending ? pending.newRemaining : session.newRemaining,
+    failure: null,
+    notice: null,
+    phase: settle(queue, action.now),
+  };
+}
+
+/**
+ * 409(別版)・404(消えた)で確定した。手元の version が古いと分かったので、
+ * そのカードは落として取り直す(呼び出し側が `loadDue` する)。
+ * 保留していた応答もこの確定より前の内容なので捨てる。
+ */
+function conflictSend(session: Session, attempt: ReviewAttempt): Session {
+  if (!isSending(session.phase, attempt)) return session;
+  return {
+    ...session,
+    queue: session.queue.filter((q) => q.cardId !== attempt.cardId),
+    pending: null,
+    phase: { kind: "idle" },
+    failure: null,
+  };
+}
+
+/** 期限が来た短期カードを出す。出している・送っている間は何もしない(不変条件 B)。 */
+function tick(session: Session, now: number): Session {
+  if (session.phase.kind !== "idle") return session;
+  const next = earliestDue(session.queue, now);
+  if (!next) return session;
+  return { ...session, phase: { kind: "showing", cardId: next.cardId, revealedAt: null } };
+}
+
+// --- 画面が読む値 ---
+
+function shownCardId(phase: Phase): string | null {
+  if (phase.kind === "showing") return phase.cardId;
+  if (phase.kind === "sending" || phase.kind === "unresolved") return phase.attempt.cardId;
+  return null;
+}
+
+/** いま出している 1 枚(出していなければ null)。どのカードかは状態が持つ card_id で決まる。 */
+export function currentCard(session: Session): QueuedCard | null {
+  const cardId = shownCardId(session.phase);
+  if (cardId === null) return null;
+  return session.queue.find((q) => q.cardId === cardId) ?? null;
+}
+
+/** 裏を出しているか(めくった後・送信中・未確定)。 */
+export function isRevealed(session: Session): boolean {
+  const phase = session.phase;
+  if (phase.kind === "showing") return phase.revealedAt !== null;
+  return awaitingAttempt(phase);
+}
+
+/** 送信中(ボタンは全部無効)。 */
+export function isSendingNow(session: Session): boolean {
+  return session.phase.kind === "sending";
+}
+
+/** 結果が分からない 1 件(同じ attempt の再送でしか抜けられない)。 */
+export function unresolved(session: Session): { attempt: ReviewAttempt; reason: string } | null {
+  return session.phase.kind === "unresolved" ? session.phase : null;
+}
+
+/** その評価を押せるか(送信中は不可。未確定なら同じ attempt の再送だけ)。 */
+export function canRate(session: Session, rating: ReviewRating): boolean {
+  const phase = session.phase;
+  if (phase.kind === "unresolved") return phase.attempt.rating === rating;
+  return phase.kind === "showing" && phase.revealedAt !== null;
 }
 
 /** 出せるカードが無いとき、次に出せる時刻(= 短期カードの待ち)。 */
 export function nextDueAt(session: Session, now: Date): Date | null {
-  if (currentCard(session, now)) return null;
+  if (session.phase.kind !== "idle") return null;
   const times = session.queue.map((q) => Date.parse(q.due));
   return times.length > 0 ? new Date(Math.min(...times)) : null;
 }
@@ -197,113 +463,76 @@ export function formatWait(ms: number): string {
   return minutes > 0 ? `${minutes} 分 ${seconds} 秒` : `${seconds} 秒`;
 }
 
-/** その 1 枚の裏をめくる(送信中・認証切れ、手元に無いカードのときは何もしない)。 */
-export function reveal(session: Session, card: QueuedCard, now: Date = new Date()): Session {
-  if (session.sending || session.authExpired || session.revealed) return session;
-  if (!session.queue.some((q) => q.cardId === card.cardId)) return session;
-  return { ...session, revealed: { cardId: card.cardId, at: now.getTime() } };
-}
-
-/** めくってから評価までの時間(測れなければ null)。 */
-function elapsedMsOf(session: Session, now: Date): number | null {
-  if (session.revealed === null) return null;
-  return Math.max(0, now.getTime() - session.revealed.at);
-}
-
-/** その失敗は同じ review_id で再送できるか。 */
-function resendable(error: ReviewApiError): boolean {
-  return error.error === "network_error" || error.error === "server_error";
-}
-
-/** 認証切れになった画面(送信もしないし、再送ボタンも出さない)。 */
-function expired(session: Session): Session {
-  return {
-    ...session,
-    sending: false,
-    loading: false,
-    authExpired: true,
-    failure: null,
-    notice: null,
-  };
-}
-
-/**
- * due を取り直す(初回・409・手動)。手元の待ち行列のうち、まだ期限が来ていない短期カードは残す。
- * 認証切れのあとは何もしない(再送ループを作らない)。
- *
- * 送信中は取り直さない(POST と GET を同時に走らせない)。送信の結果はその応答で決まるので、
- * 並行して始めた GET が後から返って送信後の状態を上書きし、通信中でないのにボタンが無効のまま
- * 残る、ということが起きないようにする(タブを往復すると再マウントでここに来る)。
- *
- * 取得中に重ねて呼ばれても GET は出さない(進行中の 1 件に任せる)。画面を開き直したときだけは
- * `force` で取り直す(離れている間にサーバ側が変わっている)。そのとき進行中だった古い取得は
- * 世代が合わなくなるので、応答が返っても捨てられる。
- */
-export async function loadDue(
-  session: Session,
-  set: SetSession,
-  options: { notice?: string | null; now?: Date; force?: boolean } = {},
-): Promise<void> {
-  if (session.authExpired || session.sending) return;
-  if (session.loading && !options.force) return;
-  const now = options.now ?? new Date();
-  const generation = nextGeneration();
-  set((prev) => ({
-    ...prev,
-    loading: true,
-    generation,
-    // 結果が未確定の 1 件(attempt)とその説明は捨てない。同じ review_id で再送して確定できるように。
-    failure: prev.attempt ? prev.failure : null,
-    notice: options.notice ?? null,
-  }));
-
-  const res = await getDue();
-  // 自分より後に始まった取得があれば、この応答は古い。画面には何も書かない。
-  const ifLatest = (apply: (prev: Session) => Session): void => {
-    set((prev) => (prev.generation === generation ? apply(prev) : prev));
-  };
-  if (!res.ok) {
-    if (res.error.error === "unauthenticated") return ifLatest(expired);
-    return ifLatest((prev) => ({ ...prev, loading: false, failure: describe(res.error) }));
-  }
-  ifLatest((prev) => ({
-    ...prev,
-    loading: false,
-    queue: mergeQueue(prev.queue, res.response.cards, now, prev.attempt?.cardId ?? null),
-    revealed: null,
-    newRemaining: res.response.new_remaining,
-  }));
-}
+// --- 通信(状態機械に action を流すだけ) ---
 
 function describe(error: ReviewApiError): string {
   return `${error.message}(${error.error})`;
 }
 
-/** 同じ要求(カード・評価・前提の version が同じ)の再送なら、1 回目の review_id を使い回す。 */
-function attemptFor(session: Session, card: QueuedCard, rating: ReviewRating, now: Date) {
-  const previous = session.attempt;
-  if (
-    previous &&
-    previous.cardId === card.cardId &&
-    previous.rating === rating &&
-    previous.expectedVersion === card.version
-  ) {
-    return previous;
-  }
-  return {
-    reviewId: newReviewId(),
-    cardId: card.cardId,
-    rating,
-    expectedVersion: card.version,
-    occurredAt: now.toISOString(),
-    elapsedMs: elapsedMsOf(session, now),
-  } satisfies ReviewAttempt;
+/** その失敗は同じ attempt で再送できるか(= 結果が分からない)。 */
+function resendable(error: ReviewApiError): boolean {
+  return error.error === "network_error" || error.error === "server_error";
 }
 
 /**
- * いま出ている 1 枚に評価をつけて確定する。同じ評価を押し直した再送は同じ review_id で送る。
- * 対象のカードは画面が見ているものをそのまま受け取り、めくった 1 枚と一致しなければ送らない
- *(裏を見ていないカードに評価が入らないため)。
+ * action を 1 つ流す。更新関数が見た状態(`before`)と結果(`after`)を返すので、
+ * 受理されたか(`before !== after`)と、続きで使う最新の状態が分かる。
+ */
+function dispatch(
+  set: SetSession,
+  snapshot: Session,
+  action: Action,
+): { before: Session; after: Session } {
+  let before = snapshot;
+  let after = reduce(snapshot, action);
+  set((prev) => {
+    before = prev;
+    after = reduce(prev, action);
+    return after;
+  });
+  return { before, after };
+}
+
+/**
+ * due を取り直す(初回・409・手動・画面を開き直したとき)。
+ * 受け付けるかどうかは状態機械が決める(認証切れ・送信中・取得中は何もしない)。
+ */
+export async function loadDue(
+  session: Session,
+  set: SetSession,
+  options: { notice?: string | null; force?: boolean } = {},
+): Promise<void> {
+  const started = dispatch(set, session, {
+    type: "load_started",
+    force: options.force === true,
+    notice: options.notice ?? null,
+  });
+  if (started.after === started.before) return;
+  const generation = started.after.generation;
+
+  const res = await getDue();
+  const now = Date.now();
+  if (!res.ok) {
+    if (res.error.error === "unauthenticated") {
+      dispatch(set, started.after, { type: "auth_expired", generation });
+      return;
+    }
+    dispatch(set, started.after, { type: "load_failed", generation, failure: describe(res.error) });
+    return;
+  }
+  dispatch(set, started.after, {
+    type: "load_succeeded",
+    generation,
+    cards: res.response.cards,
+    newRemaining: res.response.new_remaining,
+    now,
+  });
+}
+
+/**
+ * 出している 1 枚に評価をつける。
+ * 未確定の 1 件があるあいだは、同じカード・同じ評価(= 同じ attempt)の押し直しだけが通り、
+ * それは再送になる(新しい review_id は作らない)。
  */
 export async function rate(
   session: Session,
@@ -312,78 +541,72 @@ export async function rate(
   set: SetSession,
   now: Date = new Date(),
 ): Promise<void> {
-  if (session.sending || session.loading || session.authExpired) return;
-  if (!isRevealed(session, card)) return;
-  const inQueue = session.queue.some((q) => q.cardId === card.cardId && q.version === card.version);
-  if (!inQueue) return;
-  await send(session, attemptFor(session, card, rating, now), set, now);
+  const held = unresolved(session);
+  if (held) {
+    if (held.attempt.cardId === card.cardId && held.attempt.rating === rating) {
+      await send(session, held.attempt, set);
+    }
+    return;
+  }
+  const phase = session.phase;
+  if (phase.kind !== "showing" || phase.revealedAt === null) return;
+  await send(
+    session,
+    {
+      reviewId: newReviewId(),
+      cardId: card.cardId,
+      rating,
+      expectedVersion: card.version,
+      occurredAt: now.toISOString(),
+      elapsedMs: Math.max(0, now.getTime() - phase.revealedAt),
+    },
+    set,
+  );
 }
 
-/** 失敗した 1 件をそのまま(同じ review_id で)送り直す。 */
-export async function resend(session: Session, set: SetSession, now: Date = new Date()) {
-  // 取り直しの最中も送らない(GET と POST を同時に走らせない)。
-  if (session.sending || session.loading || session.authExpired || !session.attempt) return;
-  await send(session, session.attempt, set, now);
+/** 結果が分からない 1 件を、そのまま(同じ review_id で)送り直す。 */
+export async function resend(session: Session, set: SetSession): Promise<void> {
+  const held = unresolved(session);
+  if (held) await send(session, held.attempt, set);
 }
 
-async function send(
-  session: Session,
-  attempt: ReviewAttempt,
-  set: SetSession,
-  now: Date,
-): Promise<void> {
-  set((prev) => ({ ...prev, sending: true, attempt, failure: null, notice: null }));
+async function send(session: Session, attempt: ReviewAttempt, set: SetSession): Promise<void> {
+  const started = dispatch(set, session, { type: "send_started", attempt });
+  if (started.after === started.before) return;
+  const sending = started.after;
 
   try {
     const res = await postReview(attempt);
     if (res.ok) {
-      set((prev) => advance(prev, attempt.cardId, res.response.state, now));
+      dispatch(set, sending, {
+        type: "send_resolved",
+        attempt,
+        state: res.response.state,
+        now: Date.now(),
+      });
       return;
     }
-    if (res.error.error === "unauthenticated") return set(expired);
+    if (res.error.error === "unauthenticated") {
+      dispatch(set, sending, { type: "auth_expired", generation: null });
+      return;
+    }
     if (resendable(res.error)) {
-      set((prev) => ({ ...prev, sending: false, failure: describe(res.error) }));
+      dispatch(set, sending, { type: "send_unresolved", attempt, reason: describe(res.error) });
       return;
     }
-    // 409(別の評価で先に進んでいた)や 404(消えた)は手元が古いだけ。出し直して続ける。
-    // 送った 1 件はもう再送しない(サーバの状態が違う)ので、ここで捨ててから取り直す。
-    set((prev) => ({ ...prev, sending: false, attempt: null }));
-    await loadDue({ ...session, sending: false, loading: false, attempt: null }, set, {
+    // 409(別版)・404(消えた)はここで確定。最新を取り直して出し直す(不変条件 C)。
+    // 進行中の古い取得に任せず force で取り直す(その応答は手元の確定より前の内容)。
+    const conflicted = dispatch(set, sending, { type: "send_conflicted", attempt });
+    await loadDue(conflicted.after, set, {
       notice: `出し直した(${describe(res.error)})`,
-      now,
+      force: true,
     });
   } catch (cause) {
     // postReview は例外を出さない作りだが、万一出ても送信中のまま固まらせない。
-    set((prev) => ({
-      ...prev,
-      sending: false,
-      failure: `送信できなかった(${String(cause)})。${RESEND_HINT}`,
-    }));
+    dispatch(set, sending, {
+      type: "send_unresolved",
+      attempt,
+      reason: `送信できなかった(${String(cause)})。${RESEND_HINT}`,
+    });
   }
-}
-
-/** 確定した 1 枚を待ち行列から外す。短期カード(学習ステップ)なら待ち時間つきで戻す。 */
-function advance(
-  session: Session,
-  cardId: string,
-  state: { due: string; version: number; fsrs_state: number },
-  now: Date,
-): Session {
-  const reviewed = session.queue.find((q) => q.cardId === cardId);
-  const rest = session.queue.filter((q) => q.cardId !== cardId);
-  const shortTerm =
-    queueOfFsrsState(state.fsrs_state) === "learning" &&
-    Date.parse(state.due) - now.getTime() <= SHORT_TERM_WAIT_MAX_MS;
-  return {
-    ...session,
-    queue:
-      reviewed && shortTerm
-        ? [...rest, { ...reviewed, version: state.version, due: state.due }]
-        : rest,
-    revealed: null,
-    sending: false,
-    attempt: null,
-    failure: null,
-    notice: null,
-  };
 }

@@ -48,9 +48,9 @@ export function App() {
   const [showErrors, setShowErrors] = useState(false);
   const [paste, setPaste] = useState(() => newDraft(EMPTY_PASTE));
   const [previewed, setPreviewed] = useState<string | null>(null);
-  // 復習の進行(待ち行列・送信中の 1 件)も App が持つ。タブを往復しても短期カードの
-  // 待ちや残り枚数を失わない。
-  const [session, setSession] = useState(() => ({ ...newSession(), loading: true }));
+  // 復習の状態(状態機械の phase・待ち行列・送っている 1 件・取得の世代)も App が持つ。
+  // タブを往復しても、送信状態・再送キー・短期カードの待ちを失わない。
+  const [session, setSession] = useState(newSession);
 
   return (
     <main style={page}>
